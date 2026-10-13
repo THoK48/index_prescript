@@ -1,0 +1,15 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">지령 단말기</string>
+    <string name="title_activity_main">지령 단말기</string>
+    <string name="package_name">com.directive.terminal</string>
+    <string name="custom_url_scheme">com.directive.terminal</string>
+    <string name="widget_description">현재 활성 지령 하나를 표시합니다.</string>
+    <string name="calendar_widget_name">할 일 등록 달력</string>
+    <string name="calendar_widget_description">날짜를 눌러 할 일을 등록하는 월간 달력입니다.</string>
+    <string name="calendar_widget_previous">이전 달</string>
+    <string name="calendar_widget_next">다음 달</string>
+    <string name="calendar_widget_today">오늘</string>
+    <string name="calendar_widget_add">+ 오늘 등록</string>
+    <string name="calendar_widget_hint">날짜를 눌러 등록 · 숫자는 미완료 할 일 수</string>
+</resources>

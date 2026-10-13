@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:orientation="vertical" android:padding="10dp" android:background="@drawable/widget_background">
+    <LinearLayout android:layout_width="match_parent" android:layout_height="36dp" android:orientation="horizontal" android:gravity="center_vertical">
+        <TextView android:id="@+id/calendarPrevious" android:layout_width="36dp" android:layout_height="match_parent" android:gravity="center" android:text="‹" android:textSize="24sp" android:textColor="#2FBFFC" android:contentDescription="@string/calendar_widget_previous" />
+        <TextView android:id="@+id/calendarMonthTitle" android:layout_width="0dp" android:layout_weight="1" android:layout_height="match_parent" android:gravity="center" android:text="할 일 달력" android:textSize="15sp" android:textStyle="bold" android:textColor="#5CD0FF" android:maxLines="1" />
+        <TextView android:id="@+id/calendarNext" android:layout_width="36dp" android:layout_height="match_parent" android:gravity="center" android:text="›" android:textSize="24sp" android:textColor="#2FBFFC" android:contentDescription="@string/calendar_widget_next" />
+    </LinearLayout>
+    <LinearLayout android:layout_width="match_parent" android:layout_height="24dp" android:orientation="horizontal">
+        <TextView android:layout_width="0dp" android:layout_weight="1" android:layout_height="match_parent" android:gravity="center" android:text="일" android:textSize="10sp" android:textColor="#1C7BA6" />
+        <TextView android:layout_width="0dp" android:layout_weight="1" android:layout_height="match_parent" android:gravity="center" android:text="월" android:textSize="10sp" android:textColor="#1C7BA6" />
+        <TextView android:layout_width="0dp" android:layout_weight="1" android:layout_height="match_parent" android:gravity="center" android:text="화" android:textSize="10sp" android:textColor="#1C7BA6" />
+        <TextView android:layout_width="0dp" android:layout_weight="1" android:layout_height="match_parent" android:gravity="center" android:text="수" android:textSize="10sp" android:textColor="#1C7BA6" />
+        <TextView android:layout_width="0dp" android:layout_weight="1" android:layout_height="match_parent" android:gravity="center" android:text="목" android:textSize="10sp" android:textColor="#1C7BA6" />
+        <TextView android:layout_width="0dp" android:layout_weight="1" android:layout_height="match_parent" android:gravity="center" android:text="금" android:textSize="10sp" android:textColor="#1C7BA6" />
+        <TextView android:layout_width="0dp" android:layout_weight="1" android:layout_height="match_parent" android:gravity="center" android:text="토" android:textSize="10sp" android:textColor="#1C7BA6" />
+    </LinearLayout>
+    <LinearLayout android:id="@+id/calendarGrid" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1" android:orientation="vertical" />
+    <TextView android:layout_width="match_parent" android:layout_height="20dp" android:gravity="center_vertical" android:text="@string/calendar_widget_hint" android:textSize="8sp" android:textColor="#31536A" android:maxLines="1" />
+    <LinearLayout android:layout_width="match_parent" android:layout_height="32dp" android:orientation="horizontal">
+        <TextView android:id="@+id/calendarToday" android:layout_width="0dp" android:layout_weight="1" android:layout_height="match_parent" android:gravity="center" android:text="@string/calendar_widget_today" android:textSize="12sp" android:textColor="#2FBFFC" android:background="@drawable/calendar_widget_day" />
+        <TextView android:id="@+id/calendarAdd" android:layout_width="0dp" android:layout_weight="1" android:layout_height="match_parent" android:gravity="center" android:text="@string/calendar_widget_add" android:textSize="12sp" android:textStyle="bold" android:textColor="#02080D" android:background="@drawable/calendar_widget_today" />
+    </LinearLayout>
+</LinearLayout>

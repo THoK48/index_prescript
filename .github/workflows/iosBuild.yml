@@ -1,0 +1,242 @@
+name: iOS Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      buildKind:
+        description: Build an unsigned simulator app or a signed IPA
+        required: true
+        default: simulator
+        type: choice
+        options:
+          - simulator
+          - signedIpa
+      distributionMethod:
+        description: Export method for signedIpa; it must match the provisioning profile
+        required: true
+        default: debugging
+        type: choice
+        options:
+          - debugging
+          - release-testing
+          - app-store-connect
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  buildIos:
+    name: Build ${{ inputs.buildKind }}
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      appBundleId: com.directive.terminal
+      iosProjectPath: ios/App/App.xcodeproj
+      iosScheme: App
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build web assets and sync iOS
+        run: npm run ios:sync
+
+      - name: Confirm Xcode version
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcodeMajorVersion="$(xcodebuild -version | awk '/Xcode/ { split($2, versionParts, "."); print versionParts[1]; exit }')"
+          if [[ -z "$xcodeMajorVersion" || "$xcodeMajorVersion" -lt 26 ]]; then
+            echo "Capacitor 8 requires Xcode 26 or newer." >&2
+            exit 1
+          fi
+
+      - name: Build unsigned simulator app
+        if: inputs.buildKind == 'simulator'
+        shell: bash
+        run: |
+          set -euo pipefail
+          derivedDataPath="$RUNNER_TEMP/directive-terminal-simulator"
+          artifactPath="$RUNNER_TEMP/directive-terminal-ios-simulator.zip"
+
+          xcodebuild \
+            -project "$iosProjectPath" \
+            -scheme "$iosScheme" \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$derivedDataPath" \
+            CODE_SIGNING_ALLOWED=NO \
+            clean build
+
+          appPath="$derivedDataPath/Build/Products/Debug-iphonesimulator/App.app"
+          test -d "$appPath"
+          ditto -c -k --sequesterRsrc --keepParent "$appPath" "$artifactPath"
+          echo "simulatorArtifactPath=$artifactPath" >> "$GITHUB_ENV"
+
+      - name: Upload simulator build
+        if: inputs.buildKind == 'simulator'
+        uses: actions/upload-artifact@v7
+        with:
+          name: directive-terminal-ios-simulator-${{ github.run_number }}
+          path: ${{ env.simulatorArtifactPath }}
+          if-no-files-found: error
+          retention-days: 14
+          archive: false
+
+      - name: Check signed IPA secrets
+        if: inputs.buildKind == 'signedIpa'
+        shell: bash
+        env:
+          iosCertificateBase64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          iosCertificatePassword: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          iosProvisioningProfileBase64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          iosKeychainPassword: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+          iosTeamId: ${{ secrets.IOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          missingSecrets=()
+
+          [[ -n "$iosCertificateBase64" ]] || missingSecrets+=(IOS_CERTIFICATE_BASE64)
+          [[ -n "$iosCertificatePassword" ]] || missingSecrets+=(IOS_CERTIFICATE_PASSWORD)
+          [[ -n "$iosProvisioningProfileBase64" ]] || missingSecrets+=(IOS_PROVISIONING_PROFILE_BASE64)
+          [[ -n "$iosKeychainPassword" ]] || missingSecrets+=(IOS_KEYCHAIN_PASSWORD)
+          [[ -n "$iosTeamId" ]] || missingSecrets+=(IOS_TEAM_ID)
+
+          if (( ${#missingSecrets[@]} > 0 )); then
+            printf 'Missing repository secrets: %s\n' "${missingSecrets[*]}" >&2
+            exit 1
+          fi
+
+      - name: Install signing credentials
+        id: installSigning
+        if: inputs.buildKind == 'signedIpa'
+        shell: bash
+        env:
+          iosCertificateBase64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          iosCertificatePassword: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          iosProvisioningProfileBase64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          iosKeychainPassword: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          certificatePath="$RUNNER_TEMP/directive-terminal-signing.p12"
+          profilePath="$RUNNER_TEMP/directive-terminal.mobileprovision"
+          profilePlistPath="$RUNNER_TEMP/directive-terminal-profile.plist"
+          keychainPath="$RUNNER_TEMP/directive-terminal-signing.keychain-db"
+
+          printf '%s' "$iosCertificateBase64" | base64 -D > "$certificatePath"
+          printf '%s' "$iosProvisioningProfileBase64" | base64 -D > "$profilePath"
+
+          security create-keychain -p "$iosKeychainPassword" "$keychainPath"
+          security set-keychain-settings -lut 21600 "$keychainPath"
+          security unlock-keychain -p "$iosKeychainPassword" "$keychainPath"
+          security import "$certificatePath" \
+            -P "$iosCertificatePassword" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$keychainPath"
+          security list-keychains -d user -s "$keychainPath"
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$iosKeychainPassword" \
+            "$keychainPath"
+
+          security cms -D -i "$profilePath" -o "$profilePlistPath"
+          profileUuid="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$profilePlistPath")"
+          profileName="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$profilePlistPath")"
+          installedProfileDirectory="$HOME/Library/MobileDevice/Provisioning Profiles"
+          installedProfilePath="$installedProfileDirectory/$profileUuid.mobileprovision"
+
+          mkdir -p "$installedProfileDirectory"
+          cp "$profilePath" "$installedProfilePath"
+
+          echo "keychainPath=$keychainPath" >> "$GITHUB_OUTPUT"
+          echo "installedProfilePath=$installedProfilePath" >> "$GITHUB_OUTPUT"
+          echo "profileName=$profileName" >> "$GITHUB_OUTPUT"
+
+      - name: Archive and export signed IPA
+        if: inputs.buildKind == 'signedIpa'
+        shell: bash
+        env:
+          iosTeamId: ${{ secrets.IOS_TEAM_ID }}
+          profileName: ${{ steps.installSigning.outputs.profileName }}
+        run: |
+          set -euo pipefail
+          archivePath="$RUNNER_TEMP/directive-terminal.xcarchive"
+          exportDirectory="$RUNNER_TEMP/directive-terminal-ipa"
+          exportOptionsPath="$RUNNER_TEMP/directive-terminal-export-options.plist"
+
+          if [[ "${{ inputs.distributionMethod }}" == "debugging" ]]; then
+            signingIdentity="Apple Development"
+          else
+            signingIdentity="Apple Distribution"
+          fi
+
+          plutil -create xml1 "$exportOptionsPath"
+          /usr/libexec/PlistBuddy -c "Add :method string ${{ inputs.distributionMethod }}" "$exportOptionsPath"
+          /usr/libexec/PlistBuddy -c 'Add :signingStyle string manual' "$exportOptionsPath"
+          /usr/libexec/PlistBuddy -c "Add :teamID string $iosTeamId" "$exportOptionsPath"
+          /usr/libexec/PlistBuddy -c "Add :signingCertificate string $signingIdentity" "$exportOptionsPath"
+          /usr/libexec/PlistBuddy -c 'Add :provisioningProfiles dict' "$exportOptionsPath"
+          /usr/libexec/PlistBuddy -c "Add :provisioningProfiles:$appBundleId string $profileName" "$exportOptionsPath"
+
+          xcodebuild \
+            -project "$iosProjectPath" \
+            -scheme "$iosScheme" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$archivePath" \
+            "DEVELOPMENT_TEAM=$iosTeamId" \
+            "PRODUCT_BUNDLE_IDENTIFIER=$appBundleId" \
+            CODE_SIGN_STYLE=Manual \
+            "PROVISIONING_PROFILE_SPECIFIER=$profileName" \
+            "CODE_SIGN_IDENTITY=$signingIdentity" \
+            clean archive
+
+          xcodebuild \
+            -exportArchive \
+            -archivePath "$archivePath" \
+            -exportPath "$exportDirectory" \
+            -exportOptionsPlist "$exportOptionsPath"
+
+          ipaPath="$(find "$exportDirectory" -maxdepth 1 -type f -name '*.ipa' -print -quit)"
+          test -n "$ipaPath"
+          echo "ipaArtifactPath=$ipaPath" >> "$GITHUB_ENV"
+
+      - name: Upload signed IPA
+        if: inputs.buildKind == 'signedIpa'
+        uses: actions/upload-artifact@v7
+        with:
+          name: directive-terminal-ios-ipa-${{ github.run_number }}
+          path: ${{ env.ipaArtifactPath }}
+          if-no-files-found: error
+          retention-days: 14
+          archive: false
+
+      - name: Remove signing credentials
+        if: always() && inputs.buildKind == 'signedIpa'
+        shell: bash
+        run: |
+          set +e
+          security delete-keychain "$RUNNER_TEMP/directive-terminal-signing.keychain-db"
+          rm -f '${{ steps.installSigning.outputs.installedProfilePath }}'
+          rm -f "$RUNNER_TEMP/directive-terminal-signing.p12"
+          rm -f "$RUNNER_TEMP/directive-terminal.mobileprovision"
+          rm -f "$RUNNER_TEMP/directive-terminal-profile.plist"
+          rm -f "$RUNNER_TEMP/directive-terminal-export-options.plist"

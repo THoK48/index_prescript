@@ -1,0 +1,172 @@
+@import "tailwindcss";
+
+/* Compact layouts for short landscape viewports, including mobile on-screen keyboards. */
+@custom-variant phoneLandscape (@media (orientation: landscape) and (max-height: 600px) and (max-width: 1024px));
+
+:root {
+  color-scheme: dark;
+  --background: #000000;
+  --panel: #050e18;
+  --ink: #5cd0ff;
+  --muted: #567287;
+  --line: #165b80;
+  --cyan-primary: #2fbffc;
+  --cyan-accent: #5cd0ff;
+  --cyan-dim: #165b80;
+  --cyan-dark: #072233;
+  --cyan-glow: rgba(47, 191, 252, .42);
+  --crt-scanline-opacity: .24;
+  --crt-vignette-opacity: .84;
+  --terminalDockSpace: calc(4rem + env(safe-area-inset-bottom, 0px));
+  --terminalPageInset: 1rem;
+}
+
+* { box-sizing: border-box; }
+
+html { min-height: 100%; }
+
+body {
+  min-height: 100vh;
+  min-height: 100dvh;
+  margin: 0;
+  background: var(--background);
+  color: var(--cyan-primary);
+  font-family: "IBM Plex Mono", "Noto Sans KR", "Malgun Gothic", monospace;
+}
+
+/* Fixed, click-through CRT overlays keep the effect consistent across every route. */
+body::before {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  content: "";
+  pointer-events: none;
+  opacity: var(--crt-scanline-opacity);
+  background-image:
+    repeating-linear-gradient(0deg, transparent 0 2px, #000 2px 4px),
+    repeating-linear-gradient(90deg, #2fbffc0b 0 1px, #165b800d 1px 2px, #0000ff0b 2px 3px);
+  background-size: 100% 4px, 3px 100%;
+  mix-blend-mode: multiply;
+}
+
+body::after {
+  position: fixed;
+  inset: 0;
+  z-index: 101;
+  content: "";
+  pointer-events: none;
+  opacity: var(--crt-vignette-opacity);
+  background: radial-gradient(ellipse at center, transparent 55%, #0005 78%, #000b 100%);
+  box-shadow: inset 0 0 9rem #0009;
+}
+
+button, input, select, textarea { font: inherit; }
+button { cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: .55; }
+::selection { color: #000; background: var(--cyan-accent); }
+
+.directivePanel {
+  color: var(--ink);
+  background: transparent;
+}
+
+.terminalField {
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  border: 1px solid var(--cyan-dim);
+  border-radius: 0;
+  background: #020508;
+  color: var(--cyan-accent);
+  padding: .65rem .8rem;
+  outline: none;
+}
+.terminalField:focus { border-color: var(--cyan-primary); box-shadow: 0 0 0 2px #2fbffc44; }
+
+.darkField {
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  border: 1px solid var(--cyan-dim);
+  border-radius: 0;
+  background: #020508;
+  color: var(--cyan-accent);
+  padding: .65rem .8rem;
+  outline: none;
+}
+.darkField:focus { border-color: var(--cyan-primary); box-shadow: 0 0 0 2px #2fbffc44; }
+
+.terminalButton {
+  min-height: 48px;
+  border: 1px solid var(--cyan-primary);
+  background: var(--cyan-primary);
+  color: #000;
+  padding: .7rem 1rem;
+  text-align: center;
+  font-weight: 700;
+  transition: background .15s ease, transform .15s ease;
+}
+.terminalButton:hover:not(:disabled) { background: var(--cyan-accent); box-shadow: 0 0 14px var(--cyan-glow); transform: translateY(-1px); }
+.terminalButton:focus-visible, .outlineButton:focus-visible { outline: 2px solid var(--cyan-accent); outline-offset: 3px; }
+
+.outlineButton {
+  min-height: 48px;
+  border: 1px solid var(--cyan-dim);
+  background: transparent;
+  color: var(--cyan-primary);
+  padding: .7rem 1rem;
+  text-align: center;
+  transition: border-color .15s ease;
+}
+.outlineButton:hover:not(:disabled) { border-color: var(--cyan-primary); background: #072233; box-shadow: 0 0 12px #2fbffc1f; }
+
+/* Reserve the bottom dock and landscape notches without fixing the document's scroll height. */
+.terminalShell {
+  padding-left: max(var(--terminalPageInset), env(safe-area-inset-left, 0px));
+  padding-right: max(var(--terminalPageInset), env(safe-area-inset-right, 0px));
+  padding-top: max(1.25rem, env(safe-area-inset-top, 0px));
+  padding-bottom: calc(var(--terminalDockSpace) + 1.5rem);
+}
+
+/* The same space budget is used by modal overlays and their scrolling panels on every route. */
+.terminalDialogOverlay {
+  padding-top: max(.75rem, env(safe-area-inset-top, 0px));
+  padding-left: max(.75rem, env(safe-area-inset-left, 0px));
+  padding-right: max(.75rem, env(safe-area-inset-right, 0px));
+  padding-bottom: calc(var(--terminalDockSpace) + .75rem);
+}
+
+.terminalDialogPanel {
+  min-width: 0;
+  min-height: 0;
+  max-height: calc(100dvh - var(--terminalDockSpace) - max(.75rem, env(safe-area-inset-top, 0px)) - .75rem);
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  overflow-wrap: anywhere;
+}
+
+.terminalNavigation {
+  padding-bottom: calc(.5rem + env(safe-area-inset-bottom, 0px));
+}
+
+@media (min-width: 640px) {
+  :root { --terminalPageInset: 2rem; }
+  .terminalShell { padding-top: max(2rem, env(safe-area-inset-top, 0px)); }
+}
+
+@media (orientation: landscape) and (max-height: 600px) and (max-width: 1024px) {
+  :root { --terminalPageInset: 1rem; }
+  .terminalShell {
+    padding-top: max(.75rem, env(safe-area-inset-top, 0px));
+    padding-bottom: calc(var(--terminalDockSpace) + .75rem);
+  }
+}
+
+@media (max-width: 640px) {
+  :root {
+    --crt-scanline-opacity: .2;
+    --crt-vignette-opacity: .72;
+  }
+
+  body::after { box-shadow: inset 0 0 5rem #0008; }
+}
