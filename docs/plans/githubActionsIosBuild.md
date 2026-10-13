@@ -7,13 +7,20 @@ Windows 호스트에서 직접 실행할 수 없는 Xcode 빌드를 GitHub Actio
 ## 범위
 
 - `simulator`: Apple 서명 정보 없이 iOS 시뮬레이터용 `.app`을 컴파일하고 ZIP으로 보관한다.
+- `unsignedIpa`: 실제 iPhone용 아키텍처로 빌드한 미서명 `.ipa`를 만든다. 기기에 설치하려면 별도로 Apple 계정으로 서명해야 한다.
 - `signedIpa`: Apple 인증서와 프로비저닝 프로파일을 GitHub Actions Secrets에서 임시 키체인에 설치하고 실제 기기 배포용 IPA를 내보낸다.
 - Node.js 24에서 의존성 설치, Next.js 정적 빌드, Capacitor iOS 동기화를 수행한다.
 - 빌드 산출물은 GitHub Actions Artifacts에 14일간 보관한다.
 
 ## 제외
 
-GitHub 저장소 생성·업로드, Apple Developer 등록, 인증서·프로비저닝 프로파일 발급, App Store Connect 업로드는 자동화하지 않는다. 서명 없는 시뮬레이터 산출물은 실제 iPhone에 설치할 수 있는 IPA가 아니다.
+GitHub 저장소 생성·업로드, Apple Developer 등록, 인증서·프로비저닝 프로파일 발급, App Store Connect 업로드는 자동화하지 않는다. 서명 없는 시뮬레이터 산출물은 실제 iPhone에 설치할 수 있는 IPA가 아니다. 미서명 기기용 IPA도 단독으로 설치되지 않는다.
+
+## 무료 Apple 계정으로 본인 iPhone에 설치
+
+`unsignedIpa`를 실행해 나온 Artifact를 내려받고 `.ipa`를 추출한다. Windows용 AltServer의 `Sideload .ipa…` 기능은 이 파일을 Apple 계정으로 서명하여 연결된 iPhone에 설치할 수 있다. iOS 16 이상에서는 기기의 개발자 모드가 필요하다. 무료 계정의 프로비저닝 프로파일은 7일 후 만료되므로 앱을 다시 서명·설치해야 한다. 이 방식은 본인 기기 시험용이며 다른 사람에게 바로 설치 가능한 IPA를 배포하는 방식은 아니다.
+
+AltStore 공식 안내: https://faq.altstore.io/altstore-classic/how-to-install-altstore-windows 및 https://faq.altstore.io/release-notes/altserver
 
 ## signedIpa 입력
 
@@ -33,9 +40,10 @@ Repository Secrets에 다음 값을 설정한다.
 2. `npm ci` 후 `npm run ios:sync`
 3. Xcode 26 이상 여부 확인
 4. `simulator`이면 서명 없이 generic iOS Simulator 대상으로 빌드
-5. `signedIpa`이면 Secrets 누락 여부 확인 후 임시 키체인과 프로파일 설치
-6. 기기용 archive 생성 후 `xcodebuild -exportArchive`로 IPA 생성
-7. 산출물 업로드 후 임시 키체인과 프로파일 제거
+5. `unsignedIpa`이면 서명 없이 generic iOS 기기 대상으로 빌드하고 `Payload/App.app`을 IPA로 포장
+6. `signedIpa`이면 Secrets 누락 여부 확인 후 임시 키체인과 프로파일 설치
+7. 기기용 archive 생성 후 `xcodebuild -exportArchive`로 서명된 IPA 생성
+8. 산출물 업로드 후 임시 키체인과 프로파일 제거
 
 ## 검증 경계
 

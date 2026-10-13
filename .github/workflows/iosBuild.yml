@@ -4,12 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       buildKind:
-        description: Build an unsigned simulator app or a signed IPA
+        description: Build a simulator app, an unsigned device IPA, or a signed IPA
         required: true
         default: simulator
         type: choice
         options:
           - simulator
+          - unsignedIpa
           - signedIpa
       distributionMethod:
         description: Export method for signedIpa; it must match the provisioning profile
@@ -94,6 +95,42 @@ jobs:
         with:
           name: directive-terminal-ios-simulator-${{ github.run_number }}
           path: ${{ env.simulatorArtifactPath }}
+          if-no-files-found: error
+          retention-days: 14
+          archive: false
+
+      - name: Build unsigned device IPA for local signing
+        if: inputs.buildKind == 'unsignedIpa'
+        shell: bash
+        run: |
+          set -euo pipefail
+          derivedDataPath="$RUNNER_TEMP/directive-terminal-device"
+          packageDirectory="$RUNNER_TEMP/directive-terminal-unsigned-package"
+          artifactPath="$RUNNER_TEMP/directive-terminal-ios-unsigned.ipa"
+
+          xcodebuild \
+            -project "$iosProjectPath" \
+            -scheme "$iosScheme" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$derivedDataPath" \
+            CODE_SIGNING_ALLOWED=NO \
+            clean build
+
+          appPath="$derivedDataPath/Build/Products/Release-iphoneos/App.app"
+          test -d "$appPath"
+          mkdir -p "$packageDirectory/Payload"
+          ditto "$appPath" "$packageDirectory/Payload/App.app"
+          (cd "$packageDirectory" && ditto -c -k --sequesterRsrc Payload "$artifactPath")
+          echo "unsignedIpaArtifactPath=$artifactPath" >> "$GITHUB_ENV"
+
+      - name: Upload unsigned device IPA
+        if: inputs.buildKind == 'unsignedIpa'
+        uses: actions/upload-artifact@v7
+        with:
+          name: directive-terminal-ios-unsigned-${{ github.run_number }}
+          path: ${{ env.unsignedIpaArtifactPath }}
           if-no-files-found: error
           retention-days: 14
           archive: false

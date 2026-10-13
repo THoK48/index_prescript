@@ -99,7 +99,7 @@ npm run ios:open
 
 Xcode에서 Signing & Capabilities의 Team과 대상 기기를 선택하고 빌드합니다. Windows에서는 Xcode 빌드·서명·IPA 생성이 불가능합니다. 생성된 iOS 프로젝트는 Mac 빌드 전 단계이며 네이티브 빌드 성공을 의미하지 않습니다.
 
-Mac이 없어도 `.github/workflows/iosBuild.yml`을 GitHub Actions에서 수동 실행하면 `macos-26`과 Xcode 26으로 iOS 빌드를 수행할 수 있습니다. `simulator`는 Apple 계정 없이 시뮬레이터용 앱 ZIP을 만들고, `signedIpa`는 Apple 인증서와 프로비저닝 프로파일을 Repository Secrets로 제공했을 때 실제 기기 배포용 IPA를 만듭니다. 필요한 Secrets와 실행 방식은 `docs/plans/githubActionsIosBuild.md`에 기록했습니다. 서명 없는 결과를 IPA로 포장해도 iPhone에는 설치할 수 없으므로 두 결과를 구분합니다.
+Mac이 없어도 `.github/workflows/iosBuild.yml`을 GitHub Actions에서 수동 실행하면 `macos-26`과 Xcode 26으로 iOS 빌드를 수행할 수 있습니다. `simulator`는 Apple 계정 없이 시뮬레이터용 앱 ZIP을 만듭니다. `unsignedIpa`는 기기용 미서명 IPA를 만들며, Windows의 AltServer 등에서 본인 Apple 계정으로 서명한 뒤 개인 iPhone에 시험 설치할 수 있습니다. `signedIpa`는 Apple 인증서와 프로비저닝 프로파일을 Repository Secrets로 제공했을 때 기기 배포용 IPA를 만듭니다. 필요한 Secrets와 실행 방식은 `docs/plans/githubActionsIosBuild.md`에 기록했습니다. 미서명 결과는 IPA 형식이어도 그대로는 iPhone에 설치되지 않습니다.
 
 ## 저장 데이터 마이그레이션
 
