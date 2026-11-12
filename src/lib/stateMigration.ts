@@ -1,21 +1,36 @@
 import {
+  createDefaultSystemFallbacks,
   createInitialState,
   getInvalidDirectiveCooldownUntil,
   isInvalidDirectiveReason,
   normalizeState,
   type AppState,
   type FailureReason,
+  type IdealRoutine,
   type LocalScheduleItem,
   type PlannerCandidateDecision,
   type PlannerCandidateDisposition,
   type PlannerDecisionRecord,
   type PlannerPriorityLayer,
+  type RoutineStep,
+  type RoutineDateOverride,
   type Task,
   type TaskDeadlineTier,
   type Ticket,
   type TicketSourceType,
   type TicketStatus,
+  type SystemFallback,
 } from "./ticketMachine.ts";
+import { normalizeExecutionConstraints, normalizeUserContext, type ExecutionConstraints } from "./userContext.ts";
+
+/** Sanitizes optional source requirements without introducing fields into older source records. */
+function normalizeSourceConstraints<T extends { executionConstraints?: ExecutionConstraints }>(source: T): T {
+  const next = { ...source };
+  const normalized = normalizeExecutionConstraints(source.executionConstraints);
+  if (normalized) next.executionConstraints = normalized;
+  else delete next.executionConstraints;
+  return next;
+}
 
 export const currentStorageKey = "ticketPlannerV2";
 export const previousStorageKey = "directiveTerminalV1";
@@ -59,12 +74,29 @@ function isTaskImportance(value: unknown): value is Task["importance"] {
   return value === 1 || value === 2 || value === 3 || value === 4 || value === 5;
 }
 
+/** Restores bounded fallback settings while assigning safe defaults to older saved states. */
+function parseSystemFallbacks(value: unknown): SystemFallback[] {
+  if (!Array.isArray(value)) return createDefaultSystemFallbacks();
+  const parsed: SystemFallback[] = [];
+  const ids = new Set<string>();
+  for (const raw of value.slice(0, 12)) {
+    if (!isRecord(raw) || typeof raw.id !== "string" || !/^[a-zA-Z0-9-]{1,80}$/.test(raw.id) || ids.has(raw.id) ||
+        typeof raw.action !== "string" || !raw.action.trim() || raw.action.trim().length > 100 ||
+        typeof raw.expectedMinutes !== "number" || !Number.isInteger(raw.expectedMinutes) ||
+        raw.expectedMinutes < 1 || raw.expectedMinutes > 30) continue;
+    ids.add(raw.id);
+    parsed.push({ id: raw.id, action: raw.action.trim(), expectedMinutes: raw.expectedMinutes,
+      executionConstraints: normalizeExecutionConstraints(raw.executionConstraints) });
+  }
+  return parsed.length > 0 ? parsed : createDefaultSystemFallbacks();
+}
+
 /** Recovers valid Planner audit records while ignoring malformed optional diagnostics. */
 function parsePlannerDecisionRecords(value: unknown): PlannerDecisionRecord[] {
   if (!Array.isArray(value)) return [];
   const records: PlannerDecisionRecord[] = [];
   for (const raw of value) {
-    if (!isRecord(raw) || typeof raw.ticketId !== "string" || typeof raw.evaluatedAt !== "string" ||
+    if (!isRecord(raw) || (typeof raw.ticketId !== "string" && raw.result !== "DEFERRED") || typeof raw.evaluatedAt !== "string" ||
         typeof raw.availableMinutes !== "number" || typeof raw.selectedAction !== "string" ||
         typeof raw.selectedReason !== "string" || !Array.isArray(raw.candidates)) continue;
     const candidates: PlannerCandidateDecision[] = raw.candidates.flatMap((candidate) => {
@@ -78,6 +110,8 @@ function parsePlannerDecisionRecords(value: unknown): PlannerDecisionRecord[] {
         score: typeof candidate.score === "number" && Number.isFinite(candidate.score) ? candidate.score : null,
         disposition: candidate.disposition,
         reason: candidate.reason,
+        ...(typeof candidate.originalMinutes === "number" && Number.isFinite(candidate.originalMinutes) ? { originalMinutes: candidate.originalMinutes } : {}),
+        ...(typeof candidate.adjustedMinutes === "number" && Number.isFinite(candidate.adjustedMinutes) ? { adjustedMinutes: candidate.adjustedMinutes } : {}),
         ...(isPlannerPriorityLayer(candidate.priorityLayer) ? { priorityLayer: candidate.priorityLayer } : {}),
         ...(isTaskDeadlineTier(candidate.deadlineTier) ? { deadlineTier: candidate.deadlineTier } : {}),
         ...(isTaskImportance(candidate.importance) ? { importance: candidate.importance } : {}),
@@ -88,12 +122,14 @@ function parsePlannerDecisionRecords(value: unknown): PlannerDecisionRecord[] {
       }];
     });
     records.push({
-      ticketId: raw.ticketId,
+      ...(typeof raw.ticketId === "string" ? { ticketId: raw.ticketId } : {}),
       evaluatedAt: raw.evaluatedAt,
       availableMinutes: raw.availableMinutes,
       selectedAction: raw.selectedAction,
       selectedReason: raw.selectedReason,
       candidates,
+      ...(isRecord(raw.userContext) ? { userContext: normalizeUserContext(raw.userContext) } : {}),
+      ...(raw.result === "DIRECTIVE" || raw.result === "DEFERRED" ? { result: raw.result } : {}),
     });
   }
   return records.slice(0, 50);
@@ -116,6 +152,62 @@ function normalizeInvalidTicket(ticket: Ticket, decisions: PlannerDecisionRecord
       : ticket.cooldownUntil ?? getInvalidDirectiveCooldownUntil(ticket.sourceType, new Date(reportedAt))?.toISOString(),
     completedAt: undefined,
     failureReason: undefined,
+  };
+}
+
+/** Keeps only bounded, valid detailed steps from local or imported routine data. */
+function normalizeRoutineSteps(value: unknown): RoutineStep[] {
+  if (!Array.isArray(value)) return [];
+  const steps: RoutineStep[] = [];
+  const ids = new Set<string>();
+  for (const raw of value.slice(0, 20)) {
+    if (!isRecord(raw) || typeof raw.id !== "string" || !raw.id || ids.has(raw.id) ||
+        typeof raw.title !== "string" || !raw.title.trim() || raw.title.trim().length > 160 ||
+        (raw.actionType !== "DURATION" && raw.actionType !== "COMPLETION" && raw.actionType !== "MOVEMENT") ||
+        typeof raw.expectedMinutes !== "number" || !Number.isInteger(raw.expectedMinutes) ||
+        raw.expectedMinutes < 1 || raw.expectedMinutes > 120) continue;
+    ids.add(raw.id);
+    steps.push({
+      id: raw.id,
+      title: raw.title.trim(),
+      actionType: raw.actionType,
+      expectedMinutes: raw.expectedMinutes,
+      executionConstraints: normalizeExecutionConstraints(raw.executionConstraints),
+    });
+  }
+  return steps;
+}
+
+/** Restores unique, bounded today-only routine changes without altering recurring templates. */
+function normalizeRoutineDateOverrides(value: unknown): RoutineDateOverride[] {
+  if (!Array.isArray(value)) return [];
+  const overrides: RoutineDateOverride[] = [];
+  const dates = new Set<string>();
+  for (const raw of value.slice(-31)) {
+    if (!isRecord(raw) || typeof raw.dateKey !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(raw.dateKey) ||
+        dates.has(raw.dateKey) || typeof raw.startTime !== "string" || !/^\d{2}:\d{2}$/.test(raw.startTime) ||
+        (raw.endTime !== undefined && (typeof raw.endTime !== "string" || !/^\d{2}:\d{2}$/.test(raw.endTime))) ||
+        (raw.startDayOffset !== undefined && raw.startDayOffset !== 0 && raw.startDayOffset !== 1)) continue;
+    dates.add(raw.dateKey);
+    overrides.push({
+      dateKey: raw.dateKey,
+      startTime: raw.startTime,
+      endTime: typeof raw.endTime === "string" ? raw.endTime : undefined,
+      startDayOffset: raw.startDayOffset === 1 ? 1 : 0,
+    });
+  }
+  return overrides;
+}
+
+/** Preserves existing routine behavior while normalizing optional detailed steps. */
+function normalizeRoutineTiming(routine: IdealRoutine): IdealRoutine {
+  return {
+    ...routine,
+    executionConstraints: normalizeExecutionConstraints(routine.executionConstraints),
+    timingMode: routine.timingMode === "FLEXIBLE" ? "FLEXIBLE" : "FIXED",
+    steps: normalizeRoutineSteps(routine.steps),
+    locked: Boolean(routine.locked),
+    dateOverrides: normalizeRoutineDateOverrides(routine.dateOverrides),
   };
 }
 
@@ -201,13 +293,28 @@ export function parseV2State(value: unknown): AppState | null {
       !isRecord(value.settings)) return null;
   const parsed = value as unknown as AppState;
   const plannerDecisions = parsePlannerDecisionRecords(value.plannerDecisions);
+  const deferral = isRecord(value.plannerDeferral) ? value.plannerDeferral : undefined;
+  const deferredDecision = deferral && isRecord(deferral.decision)
+    ? parsePlannerDecisionRecords([{ ...deferral.decision, result: "DEFERRED" }])[0] : undefined;
   return normalizeState({
-    tickets: parsed.tickets.map((ticket) => normalizeInvalidTicket(ticket, plannerDecisions)),
-    tasks: parsed.tasks.map((task) => ({ ...task, completedMinutes: task.completedMinutes ?? 0 })),
-    localScheduleItems: parsed.localScheduleItems,
-    idealRoutines: parsed.idealRoutines,
+    userContext: normalizeUserContext(value.userContext),
+    plannerDeferral: deferral && typeof deferral.reason === "string" && deferredDecision ? {
+      reason: deferral.reason,
+      resumeAt: typeof deferral.resumeAt === "string" && Number.isFinite(new Date(deferral.resumeAt).getTime()) ? deferral.resumeAt : undefined,
+      decision: deferredDecision,
+    } : undefined,
+    tickets: parsed.tickets.map((ticket) => ({ ...normalizeInvalidTicket(ticket, plannerDecisions),
+      executionConstraints: normalizeExecutionConstraints(ticket.executionConstraints),
+      actionType: ticket.actionType === "DURATION" || ticket.actionType === "COMPLETION" || ticket.actionType === "MOVEMENT" ? ticket.actionType : undefined,
+    })),
+    tasks: parsed.tasks.map((task) => normalizeSourceConstraints({ ...task, completedMinutes: task.completedMinutes ?? 0 })),
+    localScheduleItems: parsed.localScheduleItems.map(normalizeSourceConstraints),
+    idealRoutines: parsed.idealRoutines.map(normalizeRoutineTiming),
     plannerDecisions,
-    settings: parsed.settings,
+    settings: {
+      ...parsed.settings,
+      systemFallbacks: parseSystemFallbacks((value.settings as Record<string, unknown>).systemFallbacks),
+    },
   });
 }
 

@@ -1,15 +1,21 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { DecryptingText } from "@/components/DecryptingText";
+import { UserContextControl } from "@/components/UserContextControl";
+import { planNextTicketWithDecision } from "@/lib/planner";
+import { contextDirectiveIssuedEvent, resolveEffectiveContext } from "@/lib/userContext";
+import { formatDirectiveTiming, getOverdueTaskDeadline } from "@/lib/directiveTiming";
 import {
   getActiveTicket,
   getActiveTicketStaleness,
+  getTicketExpectedEndAt,
+  isUnlimitedDurationTicket,
   type FailureReason,
   type InvalidDirectiveReason,
   type Ticket,
 } from "@/lib/ticketMachine";
-import { playTicketSignalUntilSettled, tryPlayTicketSignal } from "@/lib/ticketSignal";
+import { playFailureAlertSound, playInformationBeepSound, playTicketSignalUntilSettled, tryPlayTicketSignal } from "@/lib/ticketSignal";
 import { useLocalState } from "@/lib/localState";
 import { invalidDirectiveReasonLabels, invalidDirectiveReasons } from "@/lib/directiveFeedback";
 
@@ -25,14 +31,40 @@ const failureReasons: { value: FailureReason; label: string }[] = [
   { value: "other", label: "기타" },
 ];
 
-/** Formats a deadline for the printed ticket card. */
-function formatDeadline(value: string | null): string {
-  if (!value) return "가능한 때에.";
-  const date = new Date(value);
-  const parts = new Intl.DateTimeFormat("ko-KR", {
-    month: "long", day: "numeric", hour: "numeric", minute: "2-digit", hour12: false,
-  }).format(date);
-  return `${parts}까지.`;
+/** Normalizes the visible action sentence without exposing recipient or Planner trigger metadata. */
+function formatDirectiveAction(ticket: Ticket): string {
+  const action = ticket.action.trim();
+  if (isUnlimitedDurationTicket(ticket)) return action;
+  return /[.!?。]$/.test(action) ? action : `${action}.`;
+}
+
+/** Blends one color channel without allowing audio timing jitter outside the valid range. */
+function blendFailureChannel(start: number, end: number, progress: number): number {
+  const normalizedProgress = Math.min(1, Math.max(0, progress));
+  return Math.round(start + (end - start) * normalizedProgress);
+}
+
+/** Creates CSS variables that move the active directive from terminal cyan to muted failure red. */
+function createFailureVisualStyle(progress: number): CSSProperties {
+  const normalizedProgress = Math.min(1, Math.max(0, progress));
+  const ink = [
+    blendFailureChannel(92, 232, normalizedProgress),
+    blendFailureChannel(208, 72, normalizedProgress),
+    blendFailureChannel(255, 88, normalizedProgress),
+  ];
+  const dim = [
+    blendFailureChannel(28, 153, normalizedProgress),
+    blendFailureChannel(123, 46, normalizedProgress),
+    blendFailureChannel(166, 58, normalizedProgress),
+  ];
+  return {
+    color: `rgb(${ink.join(" ")})`,
+    "--failure-progress": normalizedProgress,
+    "--failure-ink": `rgb(${ink.join(" ")})`,
+    "--failure-dim": `rgb(${dim.join(" ")})`,
+    "--failure-glow": `rgba(232, 72, 88, ${0.12 + normalizedProgress * 0.55})`,
+    "--failure-overlay": `rgba(94, 8, 19, ${normalizedProgress * 0.3})`,
+  } as CSSProperties;
 }
 
 /** Provides a readable fallback explanation for tickets saved before planner reasons existed. */
@@ -65,7 +97,7 @@ function getTodayExecutionCounts(tickets: Ticket[], now: Date): { completed: num
 
 /** Presents one active directive with compact landscape controls and height-bounded report dialogs. */
 export default function HomePage() {
-  const { state, issue, completeAndReissue, failAndReissue, invalidateAndReissue } = useLocalState();
+  const { state, issue, continueActive, completeAndReissue, failAndReissue, invalidateAndReissue } = useLocalState();
   const [failureReason, setFailureReason] = useState<FailureReason>("time_shortage");
   const [isFailOpen, setIsFailOpen] = useState(false);
   const [isReasonOpen, setIsReasonOpen] = useState(false);
@@ -74,13 +106,20 @@ export default function HomePage() {
   const [invalidError, setInvalidError] = useState("");
   const [isBusy, setIsBusy] = useState(false);
   const [message, setMessage] = useState("");
+  const [failurePlaybackProgress, setFailurePlaybackProgress] = useState(0);
   const [currentTime, setCurrentTime] = useState(() => new Date());
   const [dismissedStaleTicketId, setDismissedStaleTicketId] = useState<string | null>(null);
   const hasStartedEntrySignalRef = useRef(false);
   const ticket = state ? getActiveTicket(state) : null;
+  const overdueTaskDeadline = ticket ? getOverdueTaskDeadline(ticket) : null;
   const lastTicket = state?.tickets[0];
   const todayExecutionCounts = getTodayExecutionCounts(state?.tickets ?? [], currentTime);
   const ticketStaleness = ticket ? getActiveTicketStaleness(ticket, currentTime) : null;
+  const expectedEndAt = ticket && !isUnlimitedDurationTicket(ticket) ? getTicketExpectedEndAt(ticket) : null;
+  const elapsedExpectedMinutes = expectedEndAt && expectedEndAt <= currentTime
+    ? Math.max(1, Math.floor((currentTime.getTime() - expectedEndAt.getTime()) / 60_000))
+    : 0;
+  const failureVisualStyle = createFailureVisualStyle(failurePlaybackProgress);
   const isStalePromptOpen = Boolean(
     ticket
     && ticketStaleness
@@ -93,6 +132,15 @@ export default function HomePage() {
   useEffect(() => {
     const intervalId = window.setInterval(() => setCurrentTime(new Date()), 60_000);
     return () => window.clearInterval(intervalId);
+  }, []);
+
+  useEffect(() => {
+    /** Initial entry already owns the first sound; later context-driven ACTIVE transitions need their own signal. */
+    function playContextIssueSignal() {
+      if (hasStartedEntrySignalRef.current) void tryPlayTicketSignal();
+    }
+    window.addEventListener(contextDirectiveIssuedEvent, playContextIssueSignal);
+    return () => window.removeEventListener(contextDirectiveIssuedEvent, playContextIssueSignal);
   }, []);
 
   useEffect(() => {
@@ -145,7 +193,8 @@ export default function HomePage() {
     setMessage("결과 기록 및 지령 재발급 중…");
     try {
       const actionPromise = action();
-      const soundPromise = playTicketSignalUntilSettled(actionPromise);
+      const soundPromise = state && resolveEffectiveContext(state.userContext, new Date()).activity === "UNAVAILABLE"
+        ? Promise.resolve() : playTicketSignalUntilSettled(actionPromise);
       const [, success] = await Promise.all([soundPromise, actionPromise]);
       setMessage(success ? successMessage : "현재 지령 상태가 변경되었습니다. 화면을 확인해 주세요.");
       return success;
@@ -162,12 +211,31 @@ export default function HomePage() {
     setIsBusy(true);
     setMessage("신호 수신 및 지령 발행 중…");
     try {
+      const prediction = state ? planNextTicketWithDecision({ now: new Date(), tasks: state.tasks,
+        localSchedule: state.localScheduleItems, idealRoutines: state.idealRoutines, recentTickets: state.tickets,
+        settings: state.settings, userContext: state.userContext }) : null;
+      if (prediction?.kind === "DIRECTIVE") hasStartedEntrySignalRef.current = true;
       const issuePromise = issue();
-      const soundPromise = playTicketSignalUntilSettled(issuePromise);
+      const soundPromise = prediction?.kind === "DIRECTIVE" ? playTicketSignalUntilSettled(issuePromise) : Promise.resolve();
       const [, success] = await Promise.all([soundPromise, issuePromise]);
-      setMessage(success ? "새 지령이 발행되었습니다." : "현재 지령 상태가 변경되었습니다. 화면을 확인해 주세요.");
+      setMessage(success ? prediction?.kind === "DEFERRED" ? "현재 상태에 따라 지령 발행을 보류했습니다." : "새 지령이 발행되었습니다." : "현재 지령 상태가 변경되었습니다. 화면을 확인해 주세요.");
     } catch {
       setMessage("상태를 저장하지 못했습니다. 다시 시도해 주세요.");
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  /** Keeps the current directive ACTIVE and postpones its result reminder by ten minutes. */
+  async function handleContinue(ticketId: string) {
+    setIsBusy(true);
+    setMessage("현재 지령을 계속 수행하도록 알림 시각을 조정 중…");
+    try {
+      const success = await continueActive(ticketId, 10);
+      setCurrentTime(new Date());
+      setMessage(success ? "지령은 ACTIVE 상태로 유지되며 10분 뒤 다시 확인합니다." : "현재 지령이 변경되었습니다. 화면을 확인해 주세요.");
+    } catch {
+      setMessage("계속 수행 상태를 저장하지 못했습니다.");
     } finally {
       setIsBusy(false);
     }
@@ -183,12 +251,54 @@ export default function HomePage() {
     if (!success) setDismissedStaleTicketId(null);
   }
 
+  /** Plays failure feedback fully, then sounds the normal issue signal while replacing the directive. */
+  async function handleFailureAndReissue(ticketId: string) {
+    if (isBusy) return;
+    setIsBusy(true);
+    setIsFailOpen(false);
+    setIsReasonOpen(false);
+    setInvalidTicketId(null);
+    setMessage("실패 알림음 재생 중…");
+    setFailurePlaybackProgress(0.001);
+    try {
+      await playFailureAlertSound(setFailurePlaybackProgress);
+      setFailurePlaybackProgress(0);
+      setMessage("실패 기록 및 지령 재발급 중…");
+      const reissuePromise = failAndReissue(ticketId, failureReason);
+      const issueSoundPromise = state && resolveEffectiveContext(state.userContext, new Date()).activity === "UNAVAILABLE"
+        ? Promise.resolve() : playTicketSignalUntilSettled(reissuePromise);
+      const [, success] = await Promise.all([issueSoundPromise, reissuePromise]);
+      setMessage(success ? "실패 사유가 기록되고 다음 지령이 재발급되었습니다." : "현재 지령 상태가 변경되었습니다. 화면을 확인해 주세요.");
+      if (success) setFailureReason("time_shortage");
+    } catch {
+      setMessage("실패 상태를 저장하지 못했습니다. 다시 시도해 주세요.");
+    } finally {
+      setFailurePlaybackProgress(0);
+      setIsBusy(false);
+    }
+  }
+
+  /** Acknowledges stale review while retaining the same ACTIVE directive and moving its reminder. */
+  async function handleStaleContinue(ticketId: string) {
+    setDismissedStaleTicketId(ticketId);
+    await handleContinue(ticketId);
+  }
+
   /** Opens quality feedback for the current ticket identity without resolving it yet. */
   function openInvalidFeedback(ticketId: string) {
     setInvalidReason("TIME_IMPOSSIBLE");
     setInvalidError("");
     setIsFailOpen(false);
     setInvalidTicketId(ticketId);
+  }
+
+  /** Toggles Planner details immediately and plays the attached beep only when opening them. */
+  function toggleSelectionReason() {
+    const shouldOpen = !isReasonOpen;
+    if (shouldOpen) {
+      void playInformationBeepSound();
+    }
+    setIsReasonOpen(shouldOpen);
   }
 
   /** Records the selected quality reason and reissues; a stale report never applies to a replacement ticket. */
@@ -209,8 +319,9 @@ export default function HomePage() {
 
   return (
     <div className="relative flex flex-1 flex-col items-center justify-center pb-8 phoneLandscape:justify-start phoneLandscape:pb-0">
+      <UserContextControl className="absolute inset-x-0 top-8 z-10 mx-auto w-full max-w-2xl px-1 sm:px-4 phoneLandscape:static phoneLandscape:mb-3 phoneLandscape:max-w-4xl phoneLandscape:px-0" />
       {ticket && (
-        <div className="absolute inset-x-0 top-0 mx-auto flex w-full max-w-2xl items-center justify-between gap-4 px-1 text-[10px] tracking-[.12em] text-[#1c7ba6] sm:px-4 phoneLandscape:static phoneLandscape:mb-3 phoneLandscape:max-w-4xl phoneLandscape:px-0">
+        <div className="terminalDotMeta absolute inset-x-0 top-0 mx-auto flex w-full max-w-2xl items-center justify-between gap-4 px-1 text-xs tracking-[.08em] text-[#1c7ba6] sm:px-4 phoneLandscape:static phoneLandscape:mb-3 phoneLandscape:max-w-4xl phoneLandscape:px-0">
           <span><DecryptingText text={`수행 완료: ${todayExecutionCounts.completed}`} delayMs={60} /></span>
           <span><DecryptingText text={`수행 실패: ${todayExecutionCounts.failed}`} delayMs={90} /></span>
         </div>
@@ -218,51 +329,70 @@ export default function HomePage() {
       <div className="w-full min-w-0 max-w-2xl phoneLandscape:grid phoneLandscape:max-w-4xl phoneLandscape:grid-cols-[minmax(0,1fr)_8rem] phoneLandscape:items-start phoneLandscape:gap-6">
         {ticket ? (
           <>
-            <article key={ticket.id} className="directivePanel relative min-w-0 px-1 py-8 [overflow-wrap:anywhere] sm:px-4 sm:py-10 phoneLandscape:px-0 phoneLandscape:py-1" aria-label="현재 지령">
-              <p className="mb-8 text-base font-bold sm:text-lg phoneLandscape:mb-4 phoneLandscape:text-base">
-                <DecryptingText text={`[${ticket.recipient}에게]`} delayMs={120} />
-              </p>
-              <div className="space-y-5 text-xl font-semibold leading-[1.7] tracking-tight sm:space-y-6 sm:text-3xl phoneLandscape:space-y-3 phoneLandscape:text-xl phoneLandscape:leading-relaxed">
-                <p><DecryptingText text={formatDeadline(ticket.deadline)} delayMs={180} /></p>
-                <p><DecryptingText text={ticket.trigger} delayMs={240} /></p>
-                <p className="font-extrabold">
-                  <DecryptingText text={ticket.action} delayMs={300} />
+            <article
+              key={ticket.id}
+              className="directivePanel failureDirective relative min-w-0 px-1 py-8 [overflow-wrap:anywhere] sm:px-4 sm:py-10 phoneLandscape:px-0 phoneLandscape:py-1"
+              aria-label="현재 지령"
+              aria-busy={failurePlaybackProgress > 0}
+              data-failure-active={failurePlaybackProgress > 0}
+              style={failureVisualStyle}
+            >
+              <div className="failureDirectiveBody text-[24px] font-normal leading-[1.5] tracking-normal sm:text-[36px] sm:leading-[1.3334] phoneLandscape:text-[24px] phoneLandscape:leading-[1.5]">
+                <p className="mb-6 text-xs tracking-[.08em] sm:mb-7 phoneLandscape:mb-3">
+                  <DecryptingText text={`[${ticket.recipient}에게]`} delayMs={120} />
                 </p>
+                <p><DecryptingText text={formatDirectiveTiming(ticket)} delayMs={180} /></p>
+                <p className="mt-3 sm:mt-5 phoneLandscape:mt-2"><DecryptingText text={formatDirectiveAction(ticket)} delayMs={240} /></p>
               </div>
-              <div className="mt-12 flex items-center gap-2 text-[11px] tracking-[.12em] text-[#1c7ba6] phoneLandscape:mt-5">
+              <div className="failureDirectiveMeta terminalDotMeta mt-10 flex items-center gap-2 text-xs tracking-[.08em] phoneLandscape:mt-5">
                 <span><DecryptingText text={`발행 ${new Intl.DateTimeFormat("ko-KR", { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(ticket.createdAt))}`} delayMs={420} /></span>
                 <button
                   type="button"
-                  aria-label="선택 근거 보기"
+                  aria-label="지령 정보 보기"
                   aria-expanded={isReasonOpen}
                   className="group flex h-5 w-5 items-center justify-center text-[#183447] opacity-45 transition-colors hover:text-[#5cd0ff] hover:opacity-100 focus-visible:text-[#5cd0ff]"
-                  onClick={() => setIsReasonOpen((current) => !current)}
+                  onClick={toggleSelectionReason}
                 >
                   <span className="flex h-3 w-3 items-center justify-center rounded-full border border-[#0d2839] text-[7px] font-bold lowercase leading-none group-hover:border-[#1c7ba6] group-focus-visible:border-[#2fbffc]"><DecryptingText text="i" delayMs={450} /></span>
                 </button>
               </div>
               {isReasonOpen && (
                 <div className="mt-2 border-l border-[#165b80] pl-2 text-[10px] tracking-[.1em] text-[#31536a]">
+                  {ticket.sourceType === "ROUTINE" && ticket.routineTitle && (
+                    <div className="mb-3 space-y-1 border-b border-[#0d2839] pb-3">
+                      <p><DecryptingText text={`상위 루틴 / ${ticket.routineTitle}`} delayMs={30} /></p>
+                      <p><DecryptingText text={`현재 진행 단계 / ${ticket.routineStepIndex ?? 1}/${ticket.routineStepCount ?? 1}`} delayMs={35} /></p>
+                    </div>
+                  )}
                   <p role="status"><DecryptingText text={`선택 근거 / ${formatSelectionReason(ticket)}`} delayMs={40} /></p>
+                  {overdueTaskDeadline && <p className="mt-2"><DecryptingText text={`원래 할 일 마감 / ${new Intl.DateTimeFormat("ko-KR", { year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "2-digit", hour12: false }).format(overdueTaskDeadline)} · 기한 지남`} delayMs={60} /></p>}
                   <p className="mt-3"><DecryptingText text="이 지령이 적절하지 않나요?" delayMs={80} /></p>
                   <button type="button" disabled={isBusy} className="mt-1 min-h-9 text-left text-[#567287] underline decoration-[#165b80] underline-offset-4 hover:text-[#5cd0ff]" onClick={() => openInvalidFeedback(ticket.id)}><DecryptingText text="이상 지령으로 기록" delayMs={100} /></button>
                 </div>
               )}
             </article>
-            <div className="mt-5 grid grid-cols-2 gap-3 phoneLandscape:mt-4 phoneLandscape:grid-cols-1">
+            {elapsedExpectedMinutes > 0 && (
+              <div className="border border-[#e0a55b] bg-[#120d08] px-4 py-3 text-[#f0bc77] phoneLandscape:mt-2">
+                <p className="text-sm font-bold">예상 종료 시각에서 {elapsedExpectedMinutes}분 경과</p>
+                <p className="mt-1 text-[11px] leading-5 text-[#a77f52]">자동으로 완료·실패 처리되지 않았습니다. 결과를 기록하거나 계속 수행하세요.</p>
+              </div>
+            )}
+            <div className={`mt-5 grid gap-3 phoneLandscape:mt-4 ${elapsedExpectedMinutes > 0 ? "grid-cols-3 phoneLandscape:grid-cols-3" : "grid-cols-2 phoneLandscape:grid-cols-1"}`}>
               <button className="terminalButton" disabled={isBusy} onClick={() => handleReissue(() => completeAndReissue(ticket.id), "완료가 기록되고 다음 지령이 재발급되었습니다.")}>완료</button>
               <button className="outlineButton" disabled={isBusy} onClick={() => setIsFailOpen(true)}>실패</button>
+              {elapsedExpectedMinutes > 0 && <button className="outlineButton" disabled={isBusy} onClick={() => void handleContinue(ticket.id)}>계속 수행</button>}
             </div>
           </>
         ) : (
           <section className="border border-[#165b80] bg-[#050e18] px-6 py-10 text-center shadow-[0_0_24px_#2fbffc17] sm:px-12 sm:py-14 phoneLandscape:col-span-2 phoneLandscape:px-6 phoneLandscape:py-5">
             <div className="mx-auto mb-7 flex h-16 w-16 items-center justify-center border border-[#2fbffc] text-3xl text-[#5cd0ff] shadow-[0_0_14px_#2fbffc33] phoneLandscape:mb-3 phoneLandscape:h-10 phoneLandscape:w-10 phoneLandscape:text-xl" aria-hidden="true">⌁</div>
             <p className="mb-3 text-xs tracking-[.22em] text-[#1c7ba6]">NO ACTIVE DIRECTIVE</p>
-            <h1 className="mb-4 text-3xl font-bold sm:text-4xl phoneLandscape:mb-2 phoneLandscape:text-2xl">현재 지령 없음</h1>
+            <h1 className="mb-4 text-3xl font-bold sm:text-4xl phoneLandscape:mb-2 phoneLandscape:text-2xl">{state.plannerDeferral ? "지령 발행 보류" : "현재 지령 없음"}</h1>
             <p className="mx-auto mb-9 max-w-sm text-sm leading-7 text-[#567287] phoneLandscape:mb-4 phoneLandscape:max-w-xl phoneLandscape:leading-5">
-              {lastTicket ? "이전 지령이 처리되었습니다. 준비되면 다음 지령을 발행하세요." : "준비되면 첫 지령을 발행하세요. 한 번에 하나의 행동만 표시됩니다."}
+              {state.plannerDeferral ? state.plannerDeferral.reason : lastTicket ? "이전 지령이 처리되었습니다. 준비되면 다음 지령을 발행하세요." : "준비되면 첫 지령을 발행하세요. 한 번에 하나의 행동만 표시됩니다."}
             </p>
-            <button className="terminalButton w-full max-w-xs" disabled={isBusy} onClick={handleIssue}>지령 발행</button>
+            {state.plannerDeferral?.resumeAt && <p className="mb-4 text-xs text-[#31536a]">다음 상태 해제 예정 / {new Date(state.plannerDeferral.resumeAt).toLocaleString("ko-KR")}</p>}
+            <button className="terminalButton w-full max-w-xs" disabled={isBusy} onClick={handleIssue}>{state.plannerDeferral ? "현재 상태로 다시 판단" : "지령 발행"}</button>
           </section>
         )}
 
@@ -300,7 +430,7 @@ export default function HomePage() {
             <p className="text-sm leading-6 text-[#567287]">{ticketStaleness.reason} 현재 상태를 임의로 변경하지 않았습니다.</p>
             <p className="mt-3 border-l border-[#165b80] pl-3 text-xs leading-5 text-[#31536a]">시간 경과 실패를 선택하면 이 지령을 이력에 남기고 현재 시각을 기준으로 즉시 다시 계획합니다.</p>
             <div className="mt-6 grid grid-cols-2 gap-3">
-              <button type="button" className="outlineButton" disabled={isBusy} onClick={() => setDismissedStaleTicketId(ticket.id)}>계속 수행</button>
+              <button type="button" className="outlineButton" disabled={isBusy} onClick={() => void handleStaleContinue(ticket.id)}>계속 수행</button>
               <button type="button" className="terminalButton" disabled={isBusy} onClick={() => void handleStaleReplan(ticket.id)}>실패 후 재계획</button>
             </div>
           </section>
@@ -324,7 +454,7 @@ export default function HomePage() {
             </fieldset>
             <div className="mt-6 grid grid-cols-2 gap-3">
               <button className="outlineButton" disabled={isBusy} onClick={() => setIsFailOpen(false)}>돌아가기</button>
-              <button className="terminalButton" disabled={isBusy} onClick={() => handleReissue(() => failAndReissue(ticket.id, failureReason), "실패 사유가 기록되고 다음 지령이 재발급되었습니다.")}>사유 기록</button>
+              <button className="terminalButton" disabled={isBusy} onClick={() => void handleFailureAndReissue(ticket.id)}>사유 기록</button>
             </div>
           </section>
         </div>

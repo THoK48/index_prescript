@@ -35,6 +35,11 @@ set APP_HOME=%DIRNAME%
 @rem Resolve any "." and ".." in APP_HOME to make it shorter.
 for %%i in ("%APP_HOME%") do set APP_HOME=%%~fi
 
+@rem Windows JDK 21 can bind an AF_UNIX pipe but fail to connect to it.
+@rem An existing file cannot hold socket files, so PipeImpl falls back to TCP.
+@rem JAVA_TOOL_OPTIONS also reaches the Gradle daemon; SETLOCAL scopes it to this build.
+set "JAVA_TOOL_OPTIONS=%JAVA_TOOL_OPTIONS% "-Djdk.net.unixdomain.tmpdir=%APP_HOME%\gradle.properties""
+
 @rem Add default JVM options here. You can also use JAVA_OPTS and GRADLE_OPTS to pass JVM options to this script.
 set DEFAULT_JVM_OPTS="-Xmx64m" "-Xms64m"
 

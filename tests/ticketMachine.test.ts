@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createDecryptionFrame } from "../src/lib/decryption.ts";
+import { formatDirectiveTiming, getDirectiveDisplayDeadline, getOverdueTaskDeadline } from "../src/lib/directiveTiming.ts";
 import {
   coordinateTicketSignal,
   createTicketPrintPlan,
   createTicketSignalPlan,
+  failureAlertAssetPath,
+  informationBeepAssetPath,
   ticketSignalAssetPath,
   ticketWaitLoopAssetPath,
 } from "../src/lib/ticketSignal.ts";
@@ -14,6 +17,10 @@ import {
   failTicket,
   getActiveTicket,
   getActiveTicketStaleness,
+  continueTicket,
+  getTicketExpectedEndAt,
+  happinessEasterEggSourceId,
+  isUnlimitedDurationTicket,
   issueTicket,
   invalidateTicket,
   normalizeState,
@@ -22,31 +29,53 @@ import { createStateBackup, migrateV1State, parseStateBackup } from "../src/lib/
 import {
   createIdealRoutine,
   createLocalScheduleItem,
+  getRoutineOverlapConflicts,
   getRoutineWindow,
+  normalizeTimeInput,
   scheduleOccursOnDate,
 } from "../src/lib/calendar.ts";
 import {
   getAvailableMinutes,
   getAvailableWindow,
   getDeadlineTier,
-  planNextTicket,
-  planNextTicketWithDecision,
+  planNextTicket as planOptionalTicket,
+  planNextTicketWithDecision as evaluatePlanner,
   type PlannerContext,
 } from "../src/lib/planner.ts";
-import { resolveAndReissueTicket } from "../src/lib/ticketLifecycle.ts";
+import { planAndIssueTicket, replanForUserContext, resolveAndReissueTicket, saveUserContextState } from "../src/lib/ticketLifecycle.ts";
+import {
+  createDefaultUserContext, getActiveContextConflict, getContextExclusion, getNextContextExpiry,
+  normalizeUserContext, resolveEffectiveContext,
+} from "../src/lib/userContext.ts";
 import { getInvalidDirectiveHistory } from "../src/lib/directiveFeedback.ts";
+import { getCurrentRoutineStep, getRoutineStepProgress, getRoutineTicketWindow } from "../src/lib/routineProgress.ts";
+import { appendObjectParticle } from "../src/lib/koreanParticle.ts";
 import {
   advanceNavigationRevealSequence,
   createNavigationRevealSequence,
   navigationIdleMs,
 } from "../src/lib/navigationVisibility.ts";
-import type { AppState, Task, Ticket, TicketCandidate } from "../src/lib/ticketMachine.ts";
+import type { AppState, IdealRoutine, LocalScheduleItem, Task, Ticket, TicketCandidate } from "../src/lib/ticketMachine.ts";
 import {
   createAndroidNotificationChannel,
   getNotificationSoundOptions,
   notificationChannelId,
   notificationSoundFile,
 } from "../src/lib/notificationSound.ts";
+
+/** Existing ordinary-context fixtures require an action; deferred behavior is asserted through evaluatePlanner below. */
+function planNextTicket(context: PlannerContext): TicketCandidate {
+  const candidate = planOptionalTicket(context);
+  assert.ok(candidate, "ordinary-context fixture unexpectedly deferred");
+  return candidate;
+}
+
+/** Explicitly narrows the tagged result for legacy action-selection regression cases. */
+function planNextTicketWithDecision(context: PlannerContext) {
+  const plan = evaluatePlanner(context);
+  assert.ok(plan.kind === "DIRECTIVE", "ordinary-context fixture unexpectedly deferred");
+  return plan;
+}
 
 import {
   createCalendarWidgetDays,
@@ -122,6 +151,16 @@ test("routes calendar widget taps to the date-specific editor", () => {
   assert.equal(parseCalendarWidgetQuery(""), null);
 });
 
+/** Resolves Korean final consonants, digits, punctuation and unknown pronunciation without 을(를). */
+test("renders one concrete Korean object particle", () => {
+  assert.equal(appendObjectParticle("운동"), "운동을");
+  assert.equal(appendObjectParticle("과제"), "과제를");
+  assert.equal(appendObjectParticle("과제!"), "“과제!”를");
+  assert.equal(appendObjectParticle("문제 1"), "문제 1을");
+  assert.equal(appendObjectParticle("PT"), "“PT” 항목을");
+  assert.doesNotMatch(appendObjectParticle("PT"), /을\(를\)/);
+});
+
 const now = new Date("2026-10-06T09:00:00.000Z");
 
 /** Verifies that only three timely clicks reveal navigation and a late click starts over. */
@@ -154,6 +193,8 @@ test("creates an accessible progressive decryption frame", () => {
 test("creates a three-beep ticket signal", () => {
   assert.equal(ticketSignalAssetPath, "/audio/limbus-beep.wav");
   assert.equal(ticketWaitLoopAssetPath, "/audio/limbus-beep-wait-loop.wav");
+  assert.equal(failureAlertAssetPath, "/audio/failure-alert.wav");
+  assert.equal(informationBeepAssetPath, "/audio/information-beep.wav");
   const signalPlan = createTicketSignalPlan();
   assert.equal(signalPlan.length, 3);
   assert.ok(signalPlan.every((tone) => tone.frequencyHz === 880 && tone.endFrequencyHz === 440));
@@ -303,6 +344,7 @@ test("migrates directives, schedules, settings, and completed/failed history", (
   assert.equal(migrated.tasks[0].completedMinutes, 0);
   assert.equal(migrated.settings.userName, "태호");
   assert.equal(migrated.settings.preferredBedtime, "00:30");
+  assert.equal(migrated.settings.systemFallbacks.at(-1)?.id, "stretch");
 });
 
 /** Verifies that a portable backup round-trip preserves the complete current state. */
@@ -387,12 +429,36 @@ test("rejects an invalid schedule time range", () => {
 test("creates a weekday ideal routine", () => {
   const result = createIdealRoutine({
     title: "공부", startTime: "22:00", endTime: "23:30", daysOfWeek: [1, 2, 3, 4, 5],
-    category: "study", priority: 4, enabled: true,
+    category: "study", priority: 4, enabled: true, timingMode: "FIXED",
   }, "routine");
   assert.equal(result.kind, "success");
   if (result.kind !== "success") return;
   assert.ok(getRoutineWindow(result.value, new Date(2026, 9, 6)));
   assert.equal(getRoutineWindow(result.value, new Date(2026, 9, 11)), null);
+});
+
+/** Rejects ambiguous full-day windows while retaining explicit overnight routine support. */
+test("routine time validation distinguishes identical and next-day end times", () => {
+  const shared = {
+    title: "야간 루틴", daysOfWeek: [2], category: "personal" as const,
+    priority: 3, enabled: true, timingMode: "FIXED" as const,
+  };
+  const ambiguous = createIdealRoutine({ ...shared, startTime: "00:00", endTime: "00:00" }, "ambiguous");
+  assert.equal(ambiguous.kind, "invalid");
+  const overnight = createIdealRoutine({ ...shared, startTime: "05:00", endTime: "04:00" }, "overnight");
+  assert.equal(overnight.kind, "success");
+  if (overnight.kind !== "success") return;
+  const window = getRoutineWindow(overnight.value, new Date(2026, 9, 6));
+  assert.equal(window?.endAt.getDate(), 7);
+  assert.equal((window!.endAt.getTime() - window!.startAt.getTime()) / 60_000, 23 * 60);
+});
+
+/** Accepts direct 24-hour keyboard entry while rejecting impossible clock values. */
+test("normalizes direct routine time entry", () => {
+  assert.equal(normalizeTimeInput("5:30"), "05:30");
+  assert.equal(normalizeTimeInput("2030"), "20:30");
+  assert.equal(normalizeTimeInput("24:00"), null);
+  assert.equal(normalizeTimeInput("12:60"), null);
 });
 
 /** Creates a deterministic Task fixture for Planner tests. */
@@ -484,7 +550,7 @@ test("Task quality cooldown survives other directives without applying failure s
 
 /** Ensures Routine feedback suppresses its source without falsely counting that occurrence as a user failure. */
 test("Routine quality feedback blocks immediate reissuance but is not an execution failure", () => {
-  const context = createPlannerContext({ idealRoutines: [{ id: "routine", title: "운동", startTime: "10:00", endTime: "11:00", daysOfWeek: [2], category: "exercise", priority: 5, enabled: true }] });
+  const context = createPlannerContext({ idealRoutines: [{ id: "routine", title: "운동", startTime: "10:00", endTime: "11:00", daysOfWeek: [2], category: "exercise", priority: 5, enabled: true, timingMode: "FIXED" }] });
   const plan = planNextTicketWithDecision(context);
   const issued = issueTicket({ ...createInitialState(), idealRoutines: context.idealRoutines }, plan.candidate, context.now, "routine-ticket", plan.decision);
   const invalid = invalidateTicket(issued.state, "routine-ticket", "ALREADY_DONE", context.now);
@@ -556,8 +622,8 @@ test("invalid feedback snapshots survive log trimming and backup restore", () =>
   assert.equal(restored.tickets[0].completedAt, undefined);
 });
 
-/** Covers the transition buffer, whole-minute rounding, cap, and recurrence across midnight. */
-test("available windows reserve five minutes and never exceed 120 minutes", () => {
+/** Covers transition buffers, fixed routine boundaries, whole-minute rounding, cap, and recurrence. */
+test("available windows use the earliest schedule or routine boundary", () => {
   const current = new Date(2026, 9, 6, 10, 0);
   const meeting = {
     id: "meeting", title: "회의", type: "work" as const,
@@ -576,6 +642,20 @@ test("available windows reserve five minutes and never exceed 120 minutes", () =
     recurrence: { frequency: "DAILY" as const },
   };
   assert.equal(getAvailableWindow(new Date(2026, 9, 6, 23, 50), [nightlySchedule]), 15);
+  const exerciseRoutine = {
+    id: "exercise", title: "운동", startTime: "20:00", endTime: "21:00",
+    daysOfWeek: [2], category: "exercise" as const, priority: 3, enabled: true, timingMode: "FIXED" as const,
+  };
+  assert.equal(getAvailableWindow(new Date(2026, 9, 6, 19, 40), [], [exerciseRoutine]), 15);
+  assert.equal(getAvailableWindow(
+    new Date(2026, 9, 6, 19, 40),
+    [{
+      ...meeting,
+      startAt: new Date(2026, 9, 6, 19, 50).toISOString(),
+      endAt: new Date(2026, 9, 6, 20, 50).toISOString(),
+    }],
+    [exerciseRoutine],
+  ), 5);
 });
 
 /** Locks exact deadline bucket boundaries including undated and overdue work. */
@@ -592,7 +672,7 @@ test("Task deadline tiers change only at the documented time boundaries", () => 
 /** Verifies that the 72-hour urgent boundary controls Task-versus-Routine selection regardless of importance. */
 test("urgent Tasks outrank Routines until the exact three-day cutoff", () => {
   const context = createPlannerContext({
-    idealRoutines: [{ id: "routine", title: "운동", startTime: "10:00", endTime: "11:00", daysOfWeek: [2], category: "exercise", priority: 5, enabled: true }],
+    idealRoutines: [{ id: "routine", title: "운동", startTime: "10:00", endTime: "11:00", daysOfWeek: [2], category: "exercise", priority: 5, enabled: true, timingMode: "FIXED" }],
   });
   const urgent = createTask({ importance: 1, dueAt: new Date(context.now.getTime() + 72 * 3_600_000).toISOString() });
   assert.equal(planNextTicket({ ...context, tasks: [urgent] }).sourceType, "TASK");
@@ -635,7 +715,7 @@ test("Task ordering uses selection history and then stable IDs", () => {
 /** Allows a Routine to run in the shared free portion before a later fixed schedule overlaps its full window. */
 test("Routines use the same available window as Tasks", () => {
   const context = createPlannerContext({
-    idealRoutines: [{ id: "study", title: "공부", startTime: "10:00", endTime: "11:30", daysOfWeek: [2], category: "study", priority: 3, enabled: true }],
+    idealRoutines: [{ id: "study", title: "공부", startTime: "10:00", endTime: "11:30", daysOfWeek: [2], category: "study", priority: 3, enabled: true, timingMode: "FIXED" }],
     localSchedule: [{ id: "meeting", title: "회의", startAt: new Date(2026, 9, 6, 10, 25).toISOString(), endAt: new Date(2026, 9, 6, 11, 0).toISOString(), type: "work" }],
   });
   const plan = planNextTicketWithDecision(context);
@@ -644,11 +724,11 @@ test("Routines use the same available window as Tasks", () => {
   assert.equal(plan.decision.availableMinutes, 20);
 });
 
-/** Excludes urgent but unworkable Tasks and Routine windows shorter than five complete minutes. */
+/** Excludes zero-work Tasks and ordinary Routine windows shorter than five complete minutes. */
 test("infeasible candidates do not block a lower priority layer", () => {
   const context = createPlannerContext({
-    tasks: [createTask({ estimatedMinutes: 4, dueAt: new Date(2026, 9, 6, 11, 0).toISOString() })],
-    idealRoutines: [{ id: "routine", title: "공부", startTime: "10:00", endTime: "11:00", daysOfWeek: [2], category: "study", priority: 3, enabled: true }],
+    tasks: [createTask({ estimatedMinutes: 5, completedMinutes: 5, dueAt: new Date(2026, 9, 6, 11, 0).toISOString() })],
+    idealRoutines: [{ id: "routine", title: "공부", startTime: "10:00", endTime: "11:00", daysOfWeek: [2], category: "study", priority: 3, enabled: true, timingMode: "FIXED" }],
   });
   assert.equal(planNextTicket(context).sourceType, "ROUTINE");
   const nearlyFinished = { ...context.idealRoutines[0], endTime: "10:05" };
@@ -677,6 +757,8 @@ test("a short free window excludes work and produces a waiting directive", () =>
   const plan = planNextTicketWithDecision(context);
   assert.equal(plan.decision.availableMinutes, 4);
   assert.equal(plan.candidate.sourceId, "system:wait-for-schedule");
+  assert.equal(plan.candidate.expectedMinutes, 9);
+  assert.equal(plan.candidate.deadline, new Date(2026, 9, 6, 10, 9).toISOString());
   assert.equal(plan.decision.candidates.find((candidate) => candidate.sourceType === "TASK")?.disposition, "EXCLUDED");
 });
 
@@ -711,7 +793,7 @@ test("Planner prioritizes an actual schedule over an overlapping routine", () =>
       id: "dinner", title: "저녁 약속", startAt: new Date(2026, 9, 6, 19, 30).toISOString(),
       endAt: new Date(2026, 9, 6, 21, 30).toISOString(), type: "appointment", recurrence: { frequency: "NONE" },
     }],
-    idealRoutines: [{ id: "exercise", title: "운동", startTime: "20:00", endTime: "21:00", daysOfWeek: [2], category: "exercise", priority: 5, enabled: true }],
+    idealRoutines: [{ id: "exercise", title: "운동", startTime: "20:00", endTime: "21:00", daysOfWeek: [2], category: "exercise", priority: 5, enabled: true, timingMode: "FIXED" }],
     recentTickets: [], settings: state.settings,
   });
   assert.equal(candidate.sourceType, "SCHEDULE");
@@ -730,7 +812,7 @@ test("Planner bounds a long Task by available time", () => {
   const candidate = planNextTicket({ now: current, tasks: [createTask()], localSchedule: schedule, idealRoutines: [], recentTickets: [], settings: state.settings });
   assert.equal(candidate.sourceType, "TASK");
   assert.equal(candidate.expectedMinutes, 20);
-  assert.equal(candidate.action, "자료구조 과제를 20분간 진행할 것.");
+  assert.equal(candidate.action, "20분 동안 자료구조 과제를 진행할 것.");
 });
 
 /** Verifies that a near deadline outranks a more important undated Task. */
@@ -774,12 +856,12 @@ test("Planner selects a routine in its current window", () => {
   const state = createInitialState();
   const candidate = planNextTicket({
     now: current, tasks: [createTask({ importance: 1 })], localSchedule: [],
-    idealRoutines: [{ id: "study", title: "저녁 공부", startTime: "22:00", endTime: "23:30", daysOfWeek: [2], category: "study", priority: 3, enabled: true }],
+    idealRoutines: [{ id: "study", title: "저녁 공부", startTime: "22:00", endTime: "23:30", daysOfWeek: [2], category: "study", priority: 3, enabled: true, timingMode: "FIXED" }],
     recentTickets: [], settings: state.settings,
   });
   assert.equal(candidate.sourceType, "ROUTINE");
   assert.equal(candidate.sourceId, "study");
-  assert.equal(candidate.action, "저녁 공부를 30분간 수행할 것.");
+  assert.equal(candidate.action, "30분 동안 저녁 공부할 것.");
 });
 
 /** Verifies that a time-shortage failure produces a smaller retry chunk. */
@@ -877,6 +959,52 @@ test("Planner rotates System fallbacks and includes stretching", () => {
   assert.equal(candidate.action, "5분간 스트레칭할 것.");
 });
 
+/** Gives one deterministic happiness result across each complete set of two hundred fallback slots. */
+test("Planner exposes the deterministic 0.5 percent fallback Easter egg", () => {
+  const current = new Date(2026, 9, 6, 20, 0);
+  const state = createInitialState();
+  const candidates = Array.from({ length: 200 }, (_, resolvedCount) => {
+    const resolvedFallbacks = Array.from({ length: resolvedCount }, (__, index): Ticket => ({
+      ...createTaskTicket("COMPLETED"),
+      id: `resolved-fallback-${resolvedCount}-${index}`,
+      sequence: index + 1,
+      sourceType: "SYSTEM",
+      sourceId: `fallback:${index % 2 === 0 ? "tidy" : "water"}`,
+      completedAt: current.toISOString(),
+    }));
+    return planNextTicket({
+      now: current, tasks: [], localSchedule: [], idealRoutines: [], recentTickets: resolvedFallbacks, settings: state.settings,
+    });
+  });
+  const easterEggs = candidates.filter((candidate) => candidate.sourceId === happinessEasterEggSourceId);
+  assert.equal(easterEggs.length, 1);
+  const candidate = easterEggs[0];
+  assert.ok(candidate);
+  assert.equal(candidate.sourceId, happinessEasterEggSourceId);
+  assert.equal(candidate.action, "행복할 것. 기간은 무제한");
+  assert.equal(isUnlimitedDurationTicket({ sourceType: candidate.sourceType, sourceId: candidate.sourceId }), true);
+});
+
+/** Uses saved fallback order and stable IDs instead of a hard-coded Planner-only list. */
+test("Planner uses user-configured System fallbacks deterministically", () => {
+  const current = new Date(2026, 9, 6, 20, 0);
+  const state = createInitialState();
+  const candidate = planNextTicket({
+    now: current,
+    tasks: [],
+    localSchedule: [],
+    idealRoutines: [],
+    recentTickets: [],
+    settings: {
+      ...state.settings,
+      systemFallbacks: [{ id: "ventilate", action: "창문을 열고 환기할 것.", expectedMinutes: 3 }],
+    },
+  });
+  assert.equal(candidate.sourceId, "fallback:ventilate");
+  assert.equal(candidate.action, "창문을 열고 환기할 것.");
+  assert.equal(candidate.expectedMinutes, 3);
+});
+
 /** Verifies stale review timing without rejecting a newly issued overdue Task. */
 test("detects stale active tickets without flagging an already overdue deadline immediately", () => {
   const issuedAt = new Date(2026, 9, 6, 10, 0);
@@ -897,4 +1025,765 @@ test("completing a Task ticket advances Task progress", () => {
   assert.equal(result.kind, "success");
   assert.equal(result.state.tasks[0].completedMinutes, 30);
   assert.equal(result.state.tasks[0].status, "DONE");
+});
+
+/** Unestimated work has a real completion, not an endless sequence of completed execution blocks. */
+test("completing an unestimated Task saves DONE before issuing a different source", () => {
+  const task = createTask({ estimatedMinutes: undefined });
+  const active = createTaskTicket("ACTIVE");
+  const state: AppState = { ...createInitialState(), tasks: [task], tickets: [active] };
+  const result = resolveAndReissueTicket(state, active.id, { kind: "complete" }, now, "next-ticket");
+  assert.equal(result.kind, "success");
+  assert.equal(result.state.tasks[0].status, "DONE");
+  assert.equal(result.state.tasks[0].completedAt, now.toISOString());
+  assert.equal(result.state.tickets.find((ticket) => ticket.id === active.id)?.sourceCompleted, true);
+  assert.notEqual(getActiveTicket(result.state)?.sourceType, "TASK");
+  assert.equal(result.state.tickets.filter((ticket) => ticket.status === "ACTIVE").length, 1);
+});
+
+/** A completed block consumes only its minutes until the estimated Task has actually finished. */
+test("partial Task completion replans the remaining minutes and finishes only at the total", () => {
+  const task = createTask({ estimatedMinutes: 45 });
+  const active = createTaskTicket("ACTIVE");
+  const state: AppState = { ...createInitialState(), tasks: [task], tickets: [active] };
+  const partial = resolveAndReissueTicket(state, active.id, { kind: "complete" }, now, "remaining-task");
+  assert.equal(partial.kind, "success");
+  assert.equal(partial.state.tasks[0].status, "DOING");
+  assert.equal(partial.state.tasks[0].completedMinutes, 30);
+  assert.equal(partial.state.tasks[0].completedAt, undefined);
+  assert.equal(partial.state.tickets.find((ticket) => ticket.id === active.id)?.sourceCompleted, false);
+  assert.equal(getActiveTicket(partial.state)?.sourceId, task.id);
+  assert.equal(getActiveTicket(partial.state)?.expectedMinutes, 15);
+  const finishedAt = new Date(now.getTime() + 15 * 60_000);
+  const finished = resolveAndReissueTicket(partial.state, "remaining-task", { kind: "complete" }, finishedAt, "after-task");
+  assert.equal(finished.kind, "success");
+  assert.equal(finished.state.tasks[0].status, "DONE");
+  assert.equal(finished.state.tasks[0].completedMinutes, 45);
+  assert.notEqual(getActiveTicket(finished.state)?.sourceType, "TASK");
+  assert.equal(finished.state.tickets.filter((ticket) => ticket.status === "ACTIVE").length, 1);
+});
+
+/** Legacy source-linked history repairs storage without counting the same progress a second time. */
+test("backup restoration recovers completed Tasks but preserves partially completed Tasks", () => {
+  const finished = createTask({ id: "finished", estimatedMinutes: 30 });
+  const partial = createTask({ id: "partial", estimatedMinutes: 45, completedMinutes: 30 });
+  const state: AppState = {
+    ...createInitialState(), tasks: [finished, partial], tickets: [
+      createTaskTicket("COMPLETED", { id: "finished-block", sourceId: finished.id, completedAt: now.toISOString() }),
+      createTaskTicket("COMPLETED", { id: "partial-block", sourceId: partial.id, completedAt: now.toISOString(), sourceCompleted: false }),
+    ],
+  };
+  const restored = parseStateBackup(JSON.parse(JSON.stringify(createStateBackup(state, now))));
+  assert.ok(restored);
+  assert.equal(restored.tasks[0].status, "DONE");
+  assert.equal(restored.tasks[0].completedMinutes, 30);
+  assert.equal(restored.tasks[1].completedMinutes, 30);
+  assert.notEqual(restored.tasks[1].status, "DONE");
+  const candidate = planNextTicket(createPlannerContext({ tasks: restored.tasks, recentTickets: restored.tickets }));
+  assert.equal(candidate.sourceId, partial.id);
+  assert.equal(candidate.expectedMinutes, 15);
+});
+
+/** A deliberate reopen creates a fresh work cycle while retaining the earlier completion record. */
+test("explicitly reopened Tasks ignore previous-cycle completion and keep source types separate", () => {
+  const reopenedAt = new Date(now.getTime() + 60_000).toISOString();
+  const task = createTask({ estimatedMinutes: 30, reopenedAt });
+  const earlier = createTaskTicket("COMPLETED", { completedAt: now.toISOString(), sourceCompleted: true });
+  const unrelated = createTaskTicket("COMPLETED", { id: "same-id-schedule", sourceType: "SCHEDULE", sourceCompleted: true });
+  const state = normalizeState({ ...createInitialState(), tasks: [task], tickets: [earlier, unrelated] });
+  assert.equal(state.tasks[0].status, "TODO");
+  assert.equal(state.tasks[0].completedMinutes, 0);
+  const candidate = planNextTicket(createPlannerContext({ now: new Date(reopenedAt), tasks: state.tasks, recentTickets: state.tickets }));
+  assert.equal(candidate.sourceType, "TASK");
+  assert.equal(candidate.sourceId, task.id);
+  assert.equal(candidate.expectedMinutes, 30);
+});
+
+/** Supplies a fixed schedule fixture whose local occurrence identity does not depend on the host timezone. */
+function createCompletionSchedule(overrides: Partial<LocalScheduleItem> = {}): LocalScheduleItem {
+  return {
+    id: "schedule", title: "병원 방문", type: "appointment",
+    startAt: new Date(2026, 9, 6, 10, 0).toISOString(),
+    endAt: new Date(2026, 9, 6, 11, 0).toISOString(),
+    ...overrides,
+  };
+}
+
+/** Completing attendance suppresses the original one-off source even if its time window is still open. */
+test("completed one-off Schedules are persisted and excluded before immediate replanning", () => {
+  const schedule = createCompletionSchedule();
+  const context = createPlannerContext({ now: new Date(2026, 9, 6, 10, 5), localSchedule: [schedule] });
+  const issued = issueTicket({ ...createInitialState(), localScheduleItems: [schedule] }, planNextTicket(context), context.now, "schedule-active");
+  const completedAt = new Date(2026, 9, 6, 10, 10);
+  const result = resolveAndReissueTicket(issued.state, "schedule-active", { kind: "complete" }, completedAt, "after-schedule");
+  assert.equal(result.kind, "success");
+  assert.equal(result.state.localScheduleItems[0].completedAt, completedAt.toISOString());
+  const completed = result.state.tickets.find((ticket) => ticket.id === "schedule-active");
+  assert.equal(completed?.schedulePhase, "EXECUTION");
+  assert.equal(completed?.scheduleOccurrenceStartAt, schedule.startAt);
+  assert.equal(completed?.sourceCompleted, true);
+  assert.notEqual(getActiveTicket(result.state)?.sourceType, "SCHEDULE");
+  const restored = parseStateBackup(JSON.parse(JSON.stringify(createStateBackup(result.state, completedAt))));
+  assert.ok(restored);
+  const plan = planNextTicketWithDecision({ ...context, localSchedule: restored.localScheduleItems, recentTickets: restored.tickets });
+  assert.notEqual(plan.candidate.sourceType, "SCHEDULE");
+  assert.ok(plan.decision.candidates.some((candidate) => candidate.sourceId === schedule.id && candidate.disposition === "EXCLUDED"));
+  const legacy = normalizeState({
+    ...createInitialState(), localScheduleItems: [schedule], tickets: result.state.tickets
+      .filter((ticket) => ticket.id === "schedule-active")
+      .map((ticket) => ({ ...ticket, sourceCompleted: undefined, schedulePhase: undefined, scheduleOccurrenceStartAt: undefined })),
+  });
+  assert.equal(legacy.localScheduleItems[0].completedAt, completedAt.toISOString());
+  assert.notEqual(planNextTicket({ ...context, localSchedule: legacy.localScheduleItems, recentTickets: legacy.tickets }).sourceType, "SCHEDULE");
+});
+
+/** An occurrence is keyed by its original start; daily and weekly templates remain usable on later dates. */
+test("recurring Schedule completion blocks only that daily or weekly occurrence", () => {
+  for (const frequency of ["DAILY", "WEEKLY"] as const) {
+    const schedule = createCompletionSchedule({ recurrence: { frequency, daysOfWeek: [2] } });
+    const current = new Date(2026, 9, 6, 10, 5);
+    const context = createPlannerContext({ now: current, localSchedule: [schedule] });
+    const issued = issueTicket({ ...createInitialState(), localScheduleItems: [schedule] }, planNextTicket(context), current, `recurring-${frequency}`);
+    const completed = completeTicket(issued.state, `recurring-${frequency}`, current);
+    assert.equal(completed.kind, "success");
+    assert.equal(completed.state.localScheduleItems[0].completedAt, undefined);
+    assert.deepEqual(completed.state.localScheduleItems[0].completedOccurrenceStarts, [schedule.startAt]);
+    const restored = parseStateBackup(JSON.parse(JSON.stringify(createStateBackup(completed.state, current))));
+    assert.ok(restored);
+    const updated = { ...context, localSchedule: restored.localScheduleItems, recentTickets: restored.tickets };
+    assert.notEqual(planNextTicket(updated).sourceType, "SCHEDULE");
+    const next = new Date(2026, 9, frequency === "DAILY" ? 7 : 13, 10, 5);
+    const candidate = planNextTicket({ ...updated, now: next });
+    assert.equal(candidate.sourceType, "SCHEDULE");
+    assert.equal(candidate.sourceId, schedule.id);
+    assert.equal(candidate.scheduleOccurrenceStartAt, new Date(2026, 9, next.getDate(), 10, 0).toISOString());
+  }
+});
+
+/** Old attendance directives can recover the start before midnight from the scheduled end, not completion date. */
+test("legacy overnight Schedule history suppresses its original occurrence only", () => {
+  const schedule = createCompletionSchedule({
+    startAt: new Date(2026, 9, 6, 23, 30).toISOString(),
+    endAt: new Date(2026, 9, 7, 0, 30).toISOString(), recurrence: { frequency: "DAILY" },
+  });
+  const completedAt = new Date(2026, 9, 7, 0, 10);
+  const legacy = createTaskTicket("COMPLETED", {
+    sourceType: "SCHEDULE", sourceId: schedule.id, action: `${schedule.title} 일정에 집중할 것.`,
+    createdAt: new Date(2026, 9, 6, 23, 45).toISOString(), deadline: schedule.endAt, completedAt: completedAt.toISOString(),
+  });
+  const restored = normalizeState({ ...createInitialState(), localScheduleItems: [schedule], tickets: [legacy] });
+  assert.deepEqual(restored.localScheduleItems[0].completedOccurrenceStarts, [schedule.startAt]);
+  const context = createPlannerContext({ now: completedAt, localSchedule: restored.localScheduleItems, recentTickets: restored.tickets });
+  assert.notEqual(planNextTicket(context).sourceType, "SCHEDULE");
+  const next = planNextTicket({ ...context, now: new Date(2026, 9, 7, 23, 45) });
+  assert.equal(next.sourceType, "SCHEDULE");
+  assert.equal(next.scheduleOccurrenceStartAt, new Date(2026, 9, 7, 23, 30).toISOString());
+});
+
+/** Preparation completes only its own phase, so attendance remains eligible when its scheduled time arrives. */
+test("Schedule preparation is not reissued and does not finish the actual event", () => {
+  const schedule = createCompletionSchedule();
+  const current = new Date(2026, 9, 6, 9, 50);
+  const context = createPlannerContext({ now: current, localSchedule: [schedule] });
+  const candidate = planNextTicket(context);
+  assert.equal(candidate.schedulePhase, "PREPARATION");
+  const issued = issueTicket({ ...createInitialState(), localScheduleItems: [schedule] }, candidate, current, "preparation");
+  const completed = completeTicket(issued.state, "preparation", new Date(2026, 9, 6, 9, 55));
+  assert.equal(completed.state.localScheduleItems[0].completedAt, undefined);
+  assert.equal(completed.state.tickets[0].sourceCompleted, false);
+  const updated = { ...context, now: new Date(2026, 9, 6, 9, 55), localSchedule: completed.state.localScheduleItems, recentTickets: completed.state.tickets };
+  assert.notEqual(planNextTicket(updated).sourceType, "SCHEDULE");
+  const attendance = planNextTicket({ ...updated, now: new Date(2026, 9, 6, 10, 0) });
+  assert.equal(attendance.sourceType, "SCHEDULE");
+  assert.equal(attendance.schedulePhase, "EXECUTION");
+  assert.equal(attendance.scheduleOccurrenceStartAt, schedule.startAt);
+});
+
+/** Completion history removes a finished time boundary without confusing identically named source IDs. */
+test("completed Schedule boundaries are ignored and sourceType prevents false completion", () => {
+  const schedule = createCompletionSchedule({ id: "shared-id" });
+  const current = new Date(2026, 9, 6, 9, 40);
+  const taskHistory = createTaskTicket("COMPLETED", { sourceId: schedule.id, sourceCompleted: true });
+  assert.equal(getAvailableWindow(current, [schedule], [], [taskHistory]), 15);
+  const history = createTaskTicket("COMPLETED", {
+    sourceType: "SCHEDULE", sourceId: schedule.id, action: `${schedule.title} 일정에 집중할 것.`,
+    schedulePhase: "EXECUTION", sourceCompleted: true, scheduleOccurrenceStartAt: schedule.startAt,
+  });
+  assert.equal(getAvailableWindow(current, [schedule], [], [history]), 120);
+  const context = createPlannerContext({ now: new Date(2026, 9, 6, 10, 5), localSchedule: [schedule], recentTickets: [taskHistory] });
+  assert.equal(planNextTicket(context).sourceType, "SCHEDULE");
+  const completedSource = { ...schedule, completedAt: now.toISOString() };
+  assert.notEqual(planNextTicket({ ...context, localSchedule: [completedSource], recentTickets: [] }).sourceType, "SCHEDULE");
+});
+
+/** Passing a planned end or reporting failure never creates a whole-source completion marker. */
+test("elapsed and failed schedules and accumulated Task minutes are not automatically completed", () => {
+  const schedule = createCompletionSchedule();
+  const failed = createTaskTicket("FAILED", {
+    sourceType: "SCHEDULE", sourceId: schedule.id, failureReason: "time_shortage", completedAt: now.toISOString(),
+  });
+  const task = createTask({ estimatedMinutes: 30, completedMinutes: 30 });
+  const state = normalizeState({ ...createInitialState(), tasks: [task], localScheduleItems: [schedule], tickets: [failed] });
+  assert.notEqual(state.tasks[0].status, "DONE");
+  assert.equal(state.tasks[0].completedAt, undefined);
+  assert.equal(state.localScheduleItems[0].completedAt, undefined);
+  const context = createPlannerContext({ now: new Date(2026, 9, 6, 12, 0), localSchedule: state.localScheduleItems, recentTickets: state.tickets });
+  planNextTicket(context);
+  assert.equal(state.localScheduleItems[0].completedAt, undefined);
+  const laterPlan = planNextTicket({ ...context, now: new Date(2026, 9, 6, 10, 10), recentTickets: [] });
+  assert.equal(laterPlan.sourceType, "SCHEDULE");
+});
+
+/** Expiry derives only from explicit time and does not clear unrelated fatigue or capability restrictions. */
+test("User Context activity fatigue and restrictions expire independently", () => {
+  const context = { ...createDefaultUserContext(), activity: "OVERTIME" as const, fatigue: "TIRED" as const,
+    blockedCapabilities: ["EXERCISE" as const], activityUntil: new Date(2026, 9, 6, 21, 0).toISOString(),
+    fatigueUntil: new Date(2026, 9, 6, 23, 0).toISOString(), capabilitiesUntil: new Date(2026, 9, 6, 22, 0).toISOString() };
+  const snapshot = JSON.stringify(context);
+  const resolved = resolveEffectiveContext(context, new Date(2026, 9, 6, 21, 0));
+  assert.equal(resolved.activity, "NORMAL");
+  assert.equal(resolved.fatigue, "TIRED");
+  assert.deepEqual(resolved.blockedCapabilities, ["EXERCISE"]);
+  assert.equal(getNextContextExpiry(resolved, new Date(2026, 9, 6, 21, 0)), context.capabilitiesUntil);
+  assert.deepEqual(resolveEffectiveContext(context, new Date(2026, 9, 6, 23, 0)), createDefaultUserContext());
+  assert.equal(JSON.stringify(context), snapshot);
+});
+
+/** Old and malformed optional data never turns clock-only text into a guessed expiry date. */
+test("User Context migration defaults missing values and rejects clock-only expiry", () => {
+  assert.deepEqual(normalizeUserContext(undefined), createDefaultUserContext());
+  const context = normalizeUserContext({ activity: "constructor", fatigue: "other", activityUntil: "21:00",
+    blockedCapabilities: ["EXERCISE", "EXERCISE", "unknown"], capabilitiesUntil: "not-a-date" });
+  assert.equal(context.activity, "NORMAL");
+  assert.equal(context.fatigue, "NORMAL");
+  assert.equal(context.activityUntil, undefined);
+  assert.deepEqual(context.blockedCapabilities, ["EXERCISE"]);
+});
+
+/** An activity does not infer prohibitions from a title or category; explicit home requirements are different. */
+test("outside context filters explicit home requirements but allows unknown requirements", () => {
+  const context = createPlannerContext({ userContext: { ...createDefaultUserContext(), activity: "OUTSIDE" },
+    tasks: [createTask({ id: "home", importance: 5, executionConstraints: { requiredCapabilities: ["AT_HOME"] } }),
+      createTask({ id: "unknown", category: "health", title: "운동", importance: 1 })] });
+  const result = evaluatePlanner(context);
+  assert.ok(result.kind === "DIRECTIVE");
+  assert.equal(result.candidate.sourceId, "unknown");
+  assert.ok(result.decision.candidates.some((candidate) => candidate.sourceId === "home" && candidate.disposition === "EXCLUDED"));
+  assert.equal(getContextExclusion(undefined, resolveEffectiveContext(context.userContext, context.now)), null);
+});
+
+/** UNAVAILABLE is a normal idle result across all source kinds, never a fake System waiting Ticket. */
+test("unavailable context defers all actions and persists its decision without ACTIVE", () => {
+  const current = new Date(2026, 9, 6, 10, 5);
+  const userContext = { ...createDefaultUserContext(), activity: "UNAVAILABLE" as const,
+    activityUntil: new Date(2026, 9, 6, 11, 0).toISOString() };
+  const state = { ...createInitialState(), userContext, tasks: [createTask()], localScheduleItems: [createCompletionSchedule()] };
+  const plan = evaluatePlanner(createPlannerContext({ now: current, userContext, tasks: state.tasks, localSchedule: state.localScheduleItems }));
+  assert.equal(plan.kind, "DEFERRED");
+  assert.equal(planOptionalTicket(createPlannerContext({ userContext })), null);
+  const saved = planAndIssueTicket(state, current, "must-not-exist");
+  assert.equal(saved.kind, "success");
+  assert.equal(getActiveTicket(saved.state), null);
+  assert.equal(saved.state.tickets.length, 0);
+  assert.equal(saved.state.plannerDeferral?.resumeAt, userContext.activityUntil);
+  assert.equal(saved.state.plannerDeferral?.decision.userContext?.activity, "UNAVAILABLE");
+  assert.equal(saved.state.plannerDecisions[0].result, "DEFERRED");
+  assert.equal(saved.state.plannerDecisions[0].ticketId, undefined);
+  const repeated = planAndIssueTicket(saved.state, new Date(current.getTime() + 60_000), "still-not-issued");
+  assert.equal(repeated.state.plannerDecisions.length, saved.state.plannerDecisions.length);
+});
+
+/** An empty feasible fallback set cannot be bypassed by the Easter egg or an invented passive instruction. */
+test("all context-blocked System fallbacks cause normal deferral", () => {
+  const userContext = { ...createDefaultUserContext(), blockedCapabilities: ["EXERCISE" as const] };
+  const context = createPlannerContext({ userContext, settings: { ...createInitialState().settings,
+    systemFallbacks: [{ id: "exercise-only", action: "운동할 것.", expectedMinutes: 5, executionConstraints: { requiredCapabilities: ["EXERCISE"] } }] } });
+  for (let offset = 0; offset < 200; offset += 1) {
+    assert.equal(evaluatePlanner({ ...context, now: new Date(context.now.getTime() + offset * 60_000) }).kind, "DEFERRED");
+  }
+});
+
+/** The current-event and preparation layers cannot outrank a hard execution constraint. */
+test("context filtering covers both Schedule execution and preparation", () => {
+  const schedule = createCompletionSchedule({ executionConstraints: { blockedActivities: ["OVERTIME"] } });
+  for (const current of [new Date(2026, 9, 6, 9, 50), new Date(2026, 9, 6, 10, 5)]) {
+    const plan = evaluatePlanner(createPlannerContext({ now: current, localSchedule: [schedule], tasks: [createTask()],
+      userContext: { ...createDefaultUserContext(), activity: "OVERTIME" } }));
+    assert.ok(plan.kind === "DIRECTIVE");
+    assert.equal(plan.candidate.sourceType, "TASK");
+    assert.ok(plan.decision.candidates.some((candidate) => candidate.sourceType === "SCHEDULE" && candidate.disposition === "EXCLUDED"));
+  }
+});
+
+/** A future event remains a time boundary when today's restriction expires before that event begins. */
+test("future boundaries use the effective context at their own start time", () => {
+  const schedule = createCompletionSchedule({ executionConstraints: { requiredCapabilities: ["AT_HOME"] } });
+  const current = new Date(2026, 9, 6, 9, 40);
+  const context = { ...createDefaultUserContext(), activity: "OUTSIDE" as const,
+    activityUntil: new Date(2026, 9, 6, 9, 50).toISOString() };
+  assert.equal(getAvailableWindow(current, [schedule], [], [], context), 15);
+  assert.equal(getAvailableWindow(current, [schedule], [], [], { ...context, activityUntil: undefined }), 120);
+});
+
+/** Context adjusts continuous work only and records both the original and adjusted block sizes. */
+test("fatigue shortens Task blocks deterministically and preserves the audit snapshot", () => {
+  for (const [fatigue, expected] of [["TIRED", 15], ["UNWELL", 10]] as const) {
+    const context = createPlannerContext({ tasks: [createTask()], userContext: { ...createDefaultUserContext(), fatigue } });
+    const plan = evaluatePlanner(context);
+    assert.ok(plan.kind === "DIRECTIVE");
+    assert.equal(plan.candidate.expectedMinutes, expected);
+    assert.match(plan.candidate.action, new RegExp(`${expected}분 동안`));
+    const audit = plan.decision.candidates.find((candidate) => candidate.disposition === "SELECTED");
+    assert.equal(audit?.originalMinutes, 30);
+    assert.equal(audit?.adjustedMinutes, expected);
+    assert.equal(plan.decision.userContext?.fatigue, fatigue);
+    assert.deepEqual(evaluatePlanner(context), plan);
+  }
+});
+
+/** A blocked current detailed step cannot be silently skipped to the next step, nor ignore parent constraints. */
+test("detailed Routine filters the current step and preserves completion and movement durations", () => {
+  const routine = { id: "detailed-context", title: "외출 준비", startTime: "10:00", endTime: "11:00", daysOfWeek: [2],
+    category: "personal" as const, priority: 3, enabled: true, timingMode: "FIXED" as const,
+    steps: [{ id: "first", title: "장비 준비", actionType: "COMPLETION" as const, expectedMinutes: 20,
+      executionConstraints: { requiredCapabilities: ["EQUIPMENT" as const] } },
+      { id: "second", title: "귀가", actionType: "MOVEMENT" as const, expectedMinutes: 20 }] };
+  const blocked = evaluatePlanner(createPlannerContext({ idealRoutines: [routine], userContext: {
+    ...createDefaultUserContext(), blockedCapabilities: ["EQUIPMENT"] } }));
+  assert.ok(blocked.kind === "DIRECTIVE");
+  assert.notEqual(blocked.candidate.sourceType, "ROUTINE");
+  const unwell = evaluatePlanner(createPlannerContext({ idealRoutines: [routine], userContext: { ...createDefaultUserContext(), fatigue: "UNWELL" } }));
+  assert.ok(unwell.kind === "DIRECTIVE");
+  assert.equal(unwell.candidate.routineStepId, "first");
+  assert.equal(unwell.candidate.expectedMinutes, 20);
+  const movement = evaluatePlanner(createPlannerContext({ idealRoutines: [{ ...routine, steps: [routine.steps[1]] }],
+    userContext: { ...createDefaultUserContext(), fatigue: "UNWELL" } }));
+  assert.ok(movement.kind === "DIRECTIVE");
+  assert.equal(movement.candidate.expectedMinutes, 20);
+  const parentBlocked = evaluatePlanner(createPlannerContext({ idealRoutines: [{ ...routine,
+    executionConstraints: { blockedActivities: ["OUTSIDE"] } }],
+    userContext: { ...createDefaultUserContext(), activity: "OUTSIDE" } }));
+  assert.ok(parentBlocked.kind === "DIRECTIVE");
+  assert.notEqual(parentBlocked.candidate.sourceType, "ROUTINE");
+});
+
+/** Unwell excludes only explicitly high-effort actions rather than guessing from category or task title. */
+test("unwell excludes explicit high effort while overtime requires an explicit activity restriction", () => {
+  const high = createTask({ id: "high", executionConstraints: { effort: "HIGH" } });
+  const normal = createTask({ id: "normal", importance: 1 });
+  const plan = evaluatePlanner(createPlannerContext({ tasks: [high, normal], userContext: { ...createDefaultUserContext(), fatigue: "UNWELL" } }));
+  assert.ok(plan.kind === "DIRECTIVE");
+  assert.equal(plan.candidate.sourceId, normal.id);
+  assert.equal(planNextTicket(createPlannerContext({ tasks: [high], userContext: { ...createDefaultUserContext(), activity: "OVERTIME" } })).sourceId, high.id);
+});
+
+/** Saving a conflicting state preserves ACTIVE; only a separate confirmation records context cancellation. */
+test("context save preserves ACTIVE and confirmed cancellation does not count failure or progress", () => {
+  const active = createTaskTicket("ACTIVE");
+  const state = { ...createInitialState(), tasks: [createTask()], tickets: [active] };
+  const context = { ...createDefaultUserContext(), activity: "UNAVAILABLE" as const };
+  const saved = saveUserContextState(state, context, now, "no-new-ticket");
+  assert.equal(getActiveTicket(saved.state)?.id, active.id);
+  assert.equal(saved.state.tickets.length, 1);
+  const cancelled = replanForUserContext(saved.state, active.id, now, "must-defer");
+  assert.equal(cancelled.kind, "success");
+  assert.equal(getActiveTicket(cancelled.state), null);
+  const history = cancelled.state.tickets[0];
+  assert.equal(history.status, "CANCELLED");
+  assert.equal(history.cancellationReason, "CONTEXT_CHANGED");
+  assert.equal(history.cancelledAt, now.toISOString());
+  assert.equal(history.failureReason, undefined);
+  assert.equal(history.completedAt, undefined);
+  assert.equal(history.invalidReason, undefined);
+  assert.equal(cancelled.state.tasks[0].completedMinutes, 0);
+  assert.ok(cancelled.state.plannerDeferral);
+});
+
+/** Confirmation cannot cancel a replacement ACTIVE or a directive whose restriction has already expired. */
+test("stale context confirmation never cancels a different or newly valid ACTIVE", () => {
+  const active = createTaskTicket("ACTIVE", { id: "replacement" });
+  const state = { ...createInitialState(), tickets: [active], userContext: { ...createDefaultUserContext(), activity: "UNAVAILABLE" as const,
+    activityUntil: new Date(now.getTime() + 60_000).toISOString() } };
+  assert.equal(replanForUserContext(state, "old-ticket", now, "next").kind, "conflict");
+  assert.equal(replanForUserContext(state, active.id, new Date(now.getTime() + 60_000), "next").kind, "conflict");
+  assert.equal(getActiveTicket(state)?.id, active.id);
+});
+
+/** Explicit completion is still saved while unavailable, but it does not force a replacement ACTIVE. */
+test("completion while unavailable saves source and history then normally defers", () => {
+  const state = { ...createInitialState(), tasks: [createTask({ estimatedMinutes: 30 })], tickets: [createTaskTicket("ACTIVE")],
+    userContext: { ...createDefaultUserContext(), activity: "UNAVAILABLE" as const } };
+  const result = resolveAndReissueTicket(state, "ticket", { kind: "complete" }, now, "no-replacement");
+  assert.equal(result.kind, "success");
+  assert.equal(result.state.tasks[0].status, "DONE");
+  assert.equal(result.state.tickets[0].status, "COMPLETED");
+  assert.equal(getActiveTicket(result.state), null);
+  assert.ok(result.state.plannerDeferral);
+});
+
+/** Optional context and constraints survive storage restoration, and expiry can resume from saved DEFERRED state. */
+test("context backup round trip preserves requirements and resumes normally after expiry", () => {
+  const context = { ...createDefaultUserContext(), activity: "UNAVAILABLE" as const, activityUntil: new Date(now.getTime() + 60_000).toISOString(),
+    fatigue: "TIRED" as const, fatigueUntil: new Date(now.getTime() + 3_600_000).toISOString() };
+  const task = createTask({ executionConstraints: { requiredCapabilities: ["FOCUS"], blockedActivities: ["OVERTIME"], effort: "NORMAL" } });
+  const deferred = planAndIssueTicket({ ...createInitialState(), userContext: context, tasks: [task] }, now, "not-issued");
+  const restored = parseStateBackup(JSON.parse(JSON.stringify(createStateBackup(deferred.state, now))));
+  assert.ok(restored);
+  assert.deepEqual(restored.userContext, context);
+  assert.deepEqual(restored.tasks[0].executionConstraints, task.executionConstraints);
+  assert.equal(restored.plannerDeferral?.decision.result, "DEFERRED");
+  const resumed = planAndIssueTicket(restored, new Date(now.getTime() + 60_000), "resumed");
+  assert.equal(getActiveTicket(resumed.state)?.sourceType, "TASK");
+  assert.equal(getActiveTicket(resumed.state)?.expectedMinutes, 15);
+  assert.equal(resumed.state.plannerDeferral, undefined);
+  assert.equal(resumed.state.plannerDecisions[1].result, "DEFERRED");
+  assert.equal(resumed.state.tickets.filter((ticket) => ticket.status === "ACTIVE").length, 1);
+});
+
+/** An issued snapshot still explains a conflict even if its original source was deleted after issuance. */
+test("ACTIVE context conflicts retain their issued execution constraint snapshot", () => {
+  const active = createTaskTicket("ACTIVE", { executionConstraints: { requiredCapabilities: ["AT_HOME"] } });
+  const state = { ...createInitialState(), tickets: [active], userContext: { ...createDefaultUserContext(), activity: "OUTSIDE" as const } };
+  assert.match(getActiveContextConflict(state, active, now) ?? "", /집에서 수행/);
+});
+
+/** A newly issued overdue Task displays this execution block's end, not yesterday's original due date. */
+test("overdue Task timing uses its current execution window without changing the original deadline", () => {
+  const issuedAt = new Date(2026, 9, 15, 17, 25);
+  const originalDeadline = new Date(2026, 9, 14, 10, 56).toISOString();
+  const ticket = createTaskTicket("ACTIVE", { createdAt: issuedAt.toISOString(), deadline: originalDeadline });
+  const snapshot = JSON.stringify(ticket);
+  assert.equal(getDirectiveDisplayDeadline(ticket)?.toISOString(), new Date(2026, 9, 15, 17, 55).toISOString());
+  assert.match(formatDirectiveTiming(ticket), /10월\s*15일\s*17:55까지/);
+  assert.equal(getOverdueTaskDeadline(ticket)?.toISOString(), originalDeadline);
+  assert.equal(JSON.stringify(ticket), snapshot);
+});
+
+/** The local start day, midnight crossing and acknowledged continuation determine execution-end display. */
+test("overdue Task timing respects midnight and continue extensions", () => {
+  const ticket = createTaskTicket("ACTIVE", { createdAt: new Date(2026, 9, 15, 23, 50).toISOString(),
+    deadline: new Date(2026, 9, 14, 10, 56).toISOString(), expectedMinutes: 30 });
+  assert.equal(getDirectiveDisplayDeadline(ticket)?.toISOString(), new Date(2026, 9, 16, 0, 20).toISOString());
+  const extendedUntil = new Date(2026, 9, 16, 0, 40).toISOString();
+  assert.equal(getDirectiveDisplayDeadline({ ...ticket, extendedUntil })?.toISOString(), extendedUntil);
+});
+
+/** Future user deadlines and fixed occurrence deadlines retain their original semantics. */
+test("future Task deadlines and Schedule or Routine timing remain unchanged", () => {
+  const issuedAt = new Date(2026, 9, 15, 17, 25).toISOString();
+  const future = new Date(2026, 9, 16, 10, 56).toISOString();
+  assert.equal(getDirectiveDisplayDeadline(createTaskTicket("ACTIVE", { createdAt: issuedAt, deadline: future }))?.toISOString(), future);
+  const past = new Date(2026, 9, 14, 10, 56).toISOString();
+  for (const sourceType of ["SCHEDULE", "ROUTINE"] as const) {
+    const ticket = createTaskTicket("ACTIVE", { sourceType, createdAt: issuedAt, deadline: past });
+    assert.equal(getDirectiveDisplayDeadline(ticket)?.toISOString(), past);
+    assert.equal(getOverdueTaskDeadline(ticket), null);
+  }
+});
+
+/** Formatting does not hide a genuinely old ACTIVE by substituting the current wall clock. */
+test("old ACTIVE timing stays tied to issuance rather than moving its deadline forward", () => {
+  const ticket = createTaskTicket("ACTIVE", { createdAt: new Date(2026, 9, 14, 17, 25).toISOString(),
+    deadline: new Date(2026, 9, 13, 10, 56).toISOString() });
+  assert.equal(getDirectiveDisplayDeadline(ticket)?.toISOString(), new Date(2026, 9, 14, 17, 55).toISOString());
+  assert.ok(getActiveTicketStaleness(ticket, new Date(2026, 9, 15, 17, 25)));
+});
+
+/** Missing or corrupt dates preserve the stable start prompt; waiting and unlimited actions keep their special lines. */
+test("directive timing retains undated fallback waiting and unlimited behavior", () => {
+  const ticket = createTaskTicket("ACTIVE", { deadline: null });
+  assert.match(formatDirectiveTiming(ticket), /^(?:[7-9]|1[0-5])분 이내에$/);
+  assert.equal(formatDirectiveTiming(ticket), formatDirectiveTiming(ticket));
+  assert.match(formatDirectiveTiming({ ...ticket, deadline: "not-a-date" }), /분 이내에$/);
+  assert.equal(formatDirectiveTiming({ ...ticket, sourceType: "SYSTEM", sourceId: "system:wait-for-schedule", expectedMinutes: 12 }), "12분 동안");
+  assert.equal(formatDirectiveTiming({ ...ticket, sourceType: "SYSTEM", sourceId: happinessEasterEggSourceId }), "");
+});
+
+/** Keeps continuation separate from completion and extends only the expected-end reminder. */
+test("continuing an overdue directive preserves ACTIVE and extends its reminder", () => {
+  const ticket = createTaskTicket("ACTIVE", { createdAt: new Date(2026, 9, 6, 10, 0).toISOString(), expectedMinutes: 30 });
+  const state: AppState = { ...createInitialState(), tickets: [ticket] };
+  const continued = continueTicket(state, ticket.id, new Date(2026, 9, 6, 10, 35), 10);
+  assert.equal(getActiveTicket(continued.state)?.id, ticket.id);
+  assert.equal(getTicketExpectedEndAt(continued.state.tickets[0]).toISOString(), new Date(2026, 9, 6, 10, 45).toISOString());
+  assert.equal(continued.state.tickets[0].completedAt, undefined);
+});
+
+/** Warns for ordinary and week-wrapping overlaps while keeping non-overlapping routines clear. */
+test("routine overlap detection covers overnight weekly boundaries", () => {
+  const sundayNight = {
+    id: "sunday-night", title: "취침", startTime: "23:30", endTime: "01:00",
+    daysOfWeek: [0], category: "sleep" as const, priority: 4, enabled: true, timingMode: "FIXED" as const,
+  };
+  const mondayMorning = {
+    title: "기상 준비", startTime: "00:30", endTime: "01:30",
+    daysOfWeek: [1], category: "personal" as const, priority: 3, enabled: true, timingMode: "FLEXIBLE" as const,
+  };
+  assert.deepEqual(getRoutineOverlapConflicts([sundayNight], mondayMorning).map(({ routine }) => routine.id), ["sunday-night"]);
+  assert.equal(getRoutineOverlapConflicts([sundayNight], { ...mondayMorning, startTime: "02:00" }).length, 0);
+});
+
+/** Uses only FIXED routine starts as shared available-time boundaries. */
+test("flexible routine starts do not shorten the available Planner window", () => {
+  const routine = {
+    id: "evening", title: "저녁 운동", startTime: "20:00", endTime: "21:00",
+    daysOfWeek: [2], category: "exercise" as const, priority: 3, enabled: true,
+  };
+  const current = new Date(2026, 9, 6, 19, 40);
+  assert.equal(getAvailableWindow(current, [], [{ ...routine, timingMode: "FIXED" }]), 15);
+  assert.equal(getAvailableWindow(current, [], [{ ...routine, timingMode: "FLEXIBLE" }]), 120);
+});
+
+/** Keeps long duration-step fixtures stable and separate from the ordinary Task source. */
+function createDetailedRoutine(overrides: Partial<IdealRoutine> = {}): IdealRoutine {
+  return {
+    id: "progressRoutine", title: "학습 루틴", startTime: "10:00", endTime: "13:00",
+    daysOfWeek: [2, 3], category: "study", priority: 3, enabled: true, timingMode: "FIXED",
+    steps: [{ id: "study", title: "공부", actionType: "DURATION", expectedMinutes: 60 },
+      { id: "finish", title: "책상 정리", actionType: "COMPLETION", expectedMinutes: 5 }],
+    ...overrides,
+  };
+}
+
+/** Finishes tiny remainders without relaxing the minimum real available-time rule. */
+test("Task remainders of one through four minutes can finish and persist as DONE", () => {
+  const current = new Date(2026, 9, 6, 10, 0);
+  for (const remaining of [1, 2, 3, 4]) {
+    const task = createTask({ estimatedMinutes: 35, completedMinutes: 35 - remaining, status: "DOING" });
+    const initial = { ...createInitialState(), tasks: [task] };
+    const issued = planAndIssueTicket(initial, current, `last${remaining}`);
+    const active = getActiveTicket(issued.state);
+    assert.ok(active);
+    assert.equal(active.sourceType, "TASK");
+    assert.equal(active.expectedMinutes, remaining);
+    const completed = resolveAndReissueTicket(issued.state, active.id, { kind: "complete" },
+      new Date(current.getTime() + remaining * 60_000), `next${remaining}`);
+    assert.equal(completed.kind, "success");
+    assert.equal(completed.state.tasks[0].status, "DONE");
+    assert.equal(completed.state.tasks[0].completedMinutes, 35);
+    assert.equal(completed.state.tickets.find((ticket) => ticket.id === active.id)?.sourceCompleted, true);
+    assert.equal(completed.state.tickets.filter((ticket) => ticket.status === "ACTIVE").length, 1);
+    assert.notEqual(getActiveTicket(completed.state)?.sourceType, "TASK");
+    const restored = parseStateBackup(JSON.parse(JSON.stringify(createStateBackup(completed.state, current))));
+    assert.equal(restored?.tasks[0].status, "DONE");
+    assert.equal(initial.tasks[0].status, "DOING");
+  }
+});
+
+/** A short remainder needs five free minutes; an empty Task never produces a zero-minute directive. */
+test("tiny Task blocks respect the four versus five minute availability boundary", () => {
+  const context = createPlannerContext({ tasks: [createTask({ estimatedMinutes: 35, completedMinutes: 34 })] });
+  const future = createDetailedRoutine({ id: "futureRoutine", startTime: "10:10", endTime: "11:00", steps: [] });
+  assert.equal(getAvailableWindow(context.now, [], [future]), 5);
+  const allowed = planNextTicket({ ...context, idealRoutines: [future] });
+  assert.equal(allowed.sourceType, "TASK");
+  assert.equal(allowed.expectedMinutes, 1);
+  const earlier = { ...future, startTime: "10:09" };
+  assert.equal(getAvailableWindow(context.now, [], [earlier]), 4);
+  assert.notEqual(planNextTicket({ ...context, idealRoutines: [earlier] }).sourceType, "TASK");
+  assert.notEqual(planNextTicket({ ...context, tasks: [createTask({ estimatedMinutes: 35, completedMinutes: 35 })] }).sourceType, "TASK");
+});
+
+/** Two completed 30-minute blocks finish a 60-minute step without exposing or skipping the next action. */
+test("detailed duration Routine advances only after its whole target is completed", () => {
+  const current = new Date(2026, 9, 6, 10, 0);
+  const routine = createDetailedRoutine();
+  const initial = { ...createInitialState(), idealRoutines: [routine] };
+  const first = planAndIssueTicket(initial, current, "firstBlock");
+  const active = getActiveTicket(first.state);
+  assert.ok(active);
+  assert.equal(active.routineStepId, "study");
+  assert.equal(active.expectedMinutes, 30);
+  assert.equal(active.routineOccurrenceStartAt, current.toISOString());
+  const second = resolveAndReissueTicket(first.state, active.id, { kind: "complete" }, new Date(2026, 9, 6, 10, 30), "secondBlock");
+  assert.equal(second.state.tickets.find((ticket) => ticket.id === "firstBlock")?.routineStepCompleted, false);
+  assert.equal(getActiveTicket(second.state)?.routineStepId, "study");
+  assert.equal(getActiveTicket(second.state)?.expectedMinutes, 30);
+  assert.match(getActiveTicket(second.state)?.selectionReason ?? "", /누적 30\/60분.*남은 30분/);
+  const third = resolveAndReissueTicket(second.state, "secondBlock", { kind: "complete" }, new Date(2026, 9, 6, 11, 0), "nextStep");
+  assert.equal(third.state.tickets.find((ticket) => ticket.id === "secondBlock")?.routineStepCompleted, true);
+  assert.equal(getActiveTicket(third.state)?.routineStepId, "finish");
+  const done = resolveAndReissueTicket(third.state, "nextStep", { kind: "complete" }, new Date(2026, 9, 6, 11, 5), "fallback");
+  assert.notEqual(getActiveTicket(done.state)?.sourceType, "ROUTINE");
+  for (const result of [first, second, third, done]) {
+    assert.equal(result.kind, "success");
+    assert.equal(result.state.tickets.filter((ticket) => ticket.status === "ACTIVE").length, 1);
+  }
+  assert.equal(initial.tickets.length, 0);
+  assert.equal(planAndIssueTicket(first.state, current, "duplicate").kind, "conflict");
+});
+
+/** Fatigue reductions consume only each completed block and retain even the small final remainder. */
+test("fatigue-shortened Routine blocks accumulate until the target rather than skipping the step", () => {
+  for (const [fatigue, blocks] of [["TIRED", [15, 15, 5]], ["UNWELL", [10, 10, 10, 5]]] as const) {
+    const routine = createDetailedRoutine({ steps: [{ id: "study", title: "공부", actionType: "DURATION", expectedMinutes: 35 }] });
+    let current = new Date(2026, 9, 6, 10, 0);
+    let state: AppState = { ...createInitialState(), idealRoutines: [routine], userContext: { ...createDefaultUserContext(), fatigue } };
+    state = planAndIssueTicket(state, current, "block0").state;
+    for (const [index, minutes] of blocks.entries()) {
+      const active = getActiveTicket(state);
+      assert.ok(active);
+      assert.equal(active.routineStepId, "study");
+      assert.equal(active.expectedMinutes, minutes);
+      current = new Date(current.getTime() + minutes * 60_000);
+      state = resolveAndReissueTicket(state, active.id, { kind: "complete" }, current, `block${index + 1}`).state;
+      assert.equal(state.tickets.find((ticket) => ticket.id === active.id)?.routineStepCompleted, index === blocks.length - 1);
+      assert.equal(state.tickets.filter((ticket) => ticket.status === "ACTIVE").length, 1);
+    }
+    assert.notEqual(getActiveTicket(state)?.sourceType, "ROUTINE");
+    const window = getRoutineWindow(routine, current);
+    assert.ok(window);
+    assert.equal(getRoutineStepProgress(routine, routine.steps![0], window, state.tickets).completedMinutes, 35);
+  }
+});
+
+/** The final one-through-four-minute duration remainder is still a real unfinished step. */
+test("detailed Routine emits a tiny final block instead of dropping or overshooting it", () => {
+  for (const remaining of [1, 2, 3, 4]) {
+    const routine = createDetailedRoutine({ steps: [{ id: "study", title: "공부", actionType: "DURATION", expectedMinutes: 30 + remaining }] });
+    const initial = { ...createInitialState(), idealRoutines: [routine] };
+    const issued = planAndIssueTicket(initial, new Date(2026, 9, 6, 10, 0), "firstBlock");
+    const resumed = resolveAndReissueTicket(issued.state, "firstBlock", { kind: "complete" }, new Date(2026, 9, 6, 10, 30), "lastBlock");
+    assert.equal(getActiveTicket(resumed.state)?.routineStepId, "study");
+    assert.equal(getActiveTicket(resumed.state)?.expectedMinutes, remaining);
+    const completed = completeTicket(resumed.state, "lastBlock", new Date(2026, 9, 6, 10, 30 + remaining));
+    assert.equal(completed.state.tickets.find((ticket) => ticket.id === "lastBlock")?.routineStepCompleted, true);
+  }
+});
+
+/** Failure shrinkage retains prior successful work without counting the failed block itself. */
+test("failed Routine block retries remaining work in shorter blocks without losing prior progress", () => {
+  const initial = { ...createInitialState(), idealRoutines: [createDetailedRoutine()] };
+  const first = planAndIssueTicket(initial, new Date(2026, 9, 6, 10, 0), "firstBlock");
+  const second = resolveAndReissueTicket(first.state, "firstBlock", { kind: "complete" }, new Date(2026, 9, 6, 10, 30), "failedBlock");
+  const retry = resolveAndReissueTicket(second.state, "failedBlock", { kind: "fail", reason: "time_shortage" }, new Date(2026, 9, 6, 10, 40), "retryBlock");
+  assert.equal(getActiveTicket(retry.state)?.routineStepId, "study");
+  assert.equal(getActiveTicket(retry.state)?.expectedMinutes, 15);
+  assert.match(getActiveTicket(retry.state)?.selectionReason ?? "", /누적 30\/60분.*남은 30분/);
+  const last = resolveAndReissueTicket(retry.state, "retryBlock", { kind: "complete" }, new Date(2026, 9, 6, 10, 55), "lastBlock");
+  assert.equal(getActiveTicket(last.state)?.routineStepId, "study");
+  assert.equal(getActiveTicket(last.state)?.expectedMinutes, 15);
+  const done = resolveAndReissueTicket(last.state, "lastBlock", { kind: "complete" }, new Date(2026, 9, 6, 11, 10), "nextStep");
+  assert.equal(getActiveTicket(done.state)?.routineStepId, "finish");
+  assert.equal(done.state.tickets.filter((ticket) => ticket.status === "FAILED").length, 1);
+  assert.equal(done.state.tickets.find((ticket) => ticket.id === "lastBlock")?.routineStepCompleted, true);
+});
+
+/** A boundary-shortened block leaves the remainder intact after the intervening fixed routine ends. */
+test("available-time truncation of a Routine does not complete the full detailed step", () => {
+  const routine = createDetailedRoutine();
+  const boundary = createDetailedRoutine({ id: "boundary", startTime: "10:20", endTime: "10:40", steps: [], priority: 1 });
+  const initial = { ...createInitialState(), idealRoutines: [routine, boundary] };
+  const first = planAndIssueTicket(initial, new Date(2026, 9, 6, 10, 0), "shortBlock");
+  assert.equal(getActiveTicket(first.state)?.expectedMinutes, 15);
+  const completed = completeTicket(first.state, "shortBlock", new Date(2026, 9, 6, 10, 15));
+  assert.equal(completed.state.tickets[0].routineStepCompleted, false);
+  const resumed = planAndIssueTicket(completed.state, new Date(2026, 9, 6, 10, 45), "resumed");
+  assert.equal(getActiveTicket(resumed.state)?.routineStepId, "study");
+  assert.equal(getActiveTicket(resumed.state)?.expectedMinutes, 30);
+  assert.match(getActiveTicket(resumed.state)?.selectionReason ?? "", /누적 15\/60분.*남은 45분/);
+});
+
+/** Only successful blocks of the same source, step and original occurrence can contribute work. */
+test("Routine progress excludes failures invalid cancellations other sources and other occurrences", () => {
+  const routine = createDetailedRoutine();
+  const window = getRoutineWindow(routine, new Date(2026, 9, 6, 10, 0));
+  assert.ok(window);
+  const base = createTaskTicket("COMPLETED", { sourceType: "ROUTINE", sourceId: routine.id, routineStepId: "study",
+    createdAt: window.startAt.toISOString(), expectedMinutes: 12, routineOccurrenceStartAt: window.startAt.toISOString(),
+    routineOccurrenceEndAt: window.endAt.toISOString() });
+  const ignored: Ticket[] = [
+    ...(["FAILED", "INVALID", "CANCELLED", "ACTIVE"] as const).map((status) => ({ ...base, status })),
+    { ...base, sourceType: "TASK" }, { ...base, sourceId: "otherRoutine" }, { ...base, routineStepId: "finish" },
+    { ...base, routineOccurrenceStartAt: new Date(2026, 9, 7, 10, 0).toISOString() },
+    { ...base, routineOccurrenceStartAt: undefined, createdAt: new Date(2026, 9, 5, 10, 0).toISOString() },
+  ];
+  const tickets = [base, ...ignored];
+  const snapshot = JSON.stringify(tickets);
+  assert.deepEqual(getRoutineStepProgress(routine, routine.steps![0], window, tickets), {
+    targetMinutes: 60, completedMinutes: 12, remainingMinutes: 48, isCompleted: false,
+  });
+  assert.deepEqual(getRoutineStepProgress(routine, routine.steps![0], window, [...tickets].reverse()),
+    getRoutineStepProgress(routine, routine.steps![0], window, tickets));
+  assert.equal(JSON.stringify(tickets), snapshot);
+});
+
+/** Completion and movement describe completed actions, not mandatory accumulated duration. */
+test("non-duration Routine steps still finish with one completion report", () => {
+  for (const actionType of ["COMPLETION", "MOVEMENT"] as const) {
+    const routine = createDetailedRoutine({ steps: [{ id: "action", title: "귀가", actionType, expectedMinutes: 60 }] });
+    const current = new Date(2026, 9, 6, 10, 0);
+    const issued = planAndIssueTicket({ ...createInitialState(), idealRoutines: [routine] }, current, "oneAction");
+    assert.equal(getActiveTicket(issued.state)?.expectedMinutes, 30);
+    const completed = resolveAndReissueTicket(issued.state, "oneAction", { kind: "complete" }, new Date(2026, 9, 6, 10, 30), "afterAction");
+    assert.equal(completed.state.tickets.find((ticket) => ticket.id === "oneAction")?.routineStepCompleted, true);
+    assert.notEqual(getActiveTicket(completed.state)?.sourceType, "ROUTINE");
+  }
+});
+
+/** Backups keep partial blocks and original occurrence fields; template data is never mutated. */
+test("Routine partial progress survives backup restoration without leaking into the next day", () => {
+  const routine = createDetailedRoutine();
+  const current = new Date(2026, 9, 6, 10, 0);
+  const initial = { ...createInitialState(), idealRoutines: [routine] };
+  const snapshot = JSON.stringify(initial);
+  const issued = planAndIssueTicket(initial, current, "firstBlock");
+  const completed = completeTicket(issued.state, "firstBlock", new Date(2026, 9, 6, 10, 30));
+  const restored = parseStateBackup(JSON.parse(JSON.stringify(createStateBackup(completed.state, current))));
+  assert.ok(restored);
+  assert.equal(restored.tickets[0].routineStepCompleted, false);
+  assert.equal(restored.tickets[0].routineOccurrenceStartAt, current.toISOString());
+  const sameDay = planAndIssueTicket(restored, new Date(2026, 9, 6, 10, 30), "sameDay");
+  assert.equal(getActiveTicket(sameDay.state)?.expectedMinutes, 30);
+  assert.equal(getActiveTicket(sameDay.state)?.routineStepId, "study");
+  const nextDay = planAndIssueTicket(restored, new Date(2026, 9, 7, 10, 0), "nextDay");
+  assert.equal(getActiveTicket(nextDay.state)?.routineStepId, "study");
+  assert.match(getActiveTicket(nextDay.state)?.selectionReason ?? "", /누적 0\/60분.*남은 60분/);
+  assert.equal(JSON.stringify(initial), snapshot);
+});
+
+/** Midnight and late reports continue to refer to the original issuing occurrence. */
+test("overnight Routine blocks retain occurrence identity even when reported after the window", () => {
+  const routine = createDetailedRoutine({ startTime: "23:30", endTime: "01:30" });
+  const initial = { ...createInitialState(), idealRoutines: [routine] };
+  const issued = planAndIssueTicket(initial, new Date(2026, 9, 6, 23, 45), "nightBlock");
+  const originalStart = new Date(2026, 9, 6, 23, 30).toISOString();
+  const midnight = resolveAndReissueTicket(issued.state, "nightBlock", { kind: "complete" }, new Date(2026, 9, 7, 0, 15), "afterMidnight");
+  assert.equal(getActiveTicket(midnight.state)?.routineStepId, "study");
+  assert.equal(getActiveTicket(midnight.state)?.expectedMinutes, 30);
+  assert.equal(getActiveTicket(midnight.state)?.routineOccurrenceStartAt, originalStart);
+  const late = completeTicket(issued.state, "nightBlock", new Date(2026, 9, 7, 2, 0));
+  assert.equal(late.state.tickets[0].routineOccurrenceStartAt, originalStart);
+  assert.equal(late.state.tickets[0].routineStepCompleted, false);
+  const nextNight = planAndIssueTicket(late.state, new Date(2026, 9, 7, 23, 45), "nextNight");
+  assert.match(getActiveTicket(nextNight.state)?.selectionReason ?? "", /누적 0\/60분/);
+});
+
+/** Existing histories recover progress from issue time rather than treating a partial block as a full step. */
+test("legacy Routine blocks without occurrence metadata preserve remaining work", () => {
+  const routine = createDetailedRoutine({ startTime: "23:30", endTime: "01:30" });
+  const legacy = createTaskTicket("COMPLETED", { sourceType: "ROUTINE", sourceId: routine.id, routineStepId: "study",
+    createdAt: new Date(2026, 9, 6, 23, 45).toISOString(), completedAt: new Date(2026, 9, 7, 0, 15).toISOString() });
+  const window = getRoutineTicketWindow(routine, legacy);
+  assert.ok(window);
+  assert.equal(window.startAt.toISOString(), new Date(2026, 9, 6, 23, 30).toISOString());
+  const step = getCurrentRoutineStep(routine, window, [legacy]);
+  assert.equal(step?.step.id, "study");
+  assert.equal(step?.progress.remainingMinutes, 30);
+  const candidate = planNextTicket(createPlannerContext({ now: new Date(2026, 9, 7, 0, 30), idealRoutines: [routine], recentTickets: [legacy] }));
+  assert.equal(candidate.routineStepId, "study");
+  assert.equal(candidate.expectedMinutes, 30);
+});
+
+/** Extending a confirmation reminder does not fabricate additional completed Routine work. */
+test("continuing a Routine reminder does not increase its completed duration", () => {
+  const routine = createDetailedRoutine();
+  const current = new Date(2026, 9, 6, 10, 0);
+  const issued = planAndIssueTicket({ ...createInitialState(), idealRoutines: [routine] }, current, "continuedBlock");
+  const extended = continueTicket(issued.state, "continuedBlock", new Date(2026, 9, 6, 10, 30), 20);
+  const completed = completeTicket(extended.state, "continuedBlock", new Date(2026, 9, 6, 10, 50));
+  const window = getRoutineWindow(routine, current);
+  assert.ok(window);
+  assert.equal(getRoutineStepProgress(routine, routine.steps![0], window, completed.state.tickets).completedMinutes, 30);
+  assert.equal(completed.state.tickets[0].routineStepCompleted, false);
 });

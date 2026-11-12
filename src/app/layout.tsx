@@ -3,6 +3,7 @@ import "./globals.css";
 import { LocalStateProvider } from "@/lib/localState";
 import { TerminalNavigation } from "@/components/TerminalNavigation";
 import { CalendarWidgetNavigation } from "@/components/CalendarWidgetNavigation";
+import { TemporalPickerDismissal } from "@/components/TemporalPickerDismissal";
 
 export const metadata: Metadata = {
   title: "지령 단말기",
@@ -20,8 +21,13 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="ko">
+      <head>
+        <link rel="preload" href="/fonts/galmuriMono11.woff2" as="font" type="font/woff2" crossOrigin="anonymous" />
+        <link rel="preload" href="/fonts/gothicDotRoundRegularV02.woff2" as="font" type="font/woff2" crossOrigin="anonymous" />
+      </head>
       <body>
         <LocalStateProvider>
+          <TemporalPickerDismissal />
           <CalendarWidgetNavigation />
           <div className="terminalShell mx-auto flex min-h-dvh w-full max-w-6xl flex-col">
             <TerminalNavigation />

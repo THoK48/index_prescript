@@ -1,5 +1,18 @@
-import { getRoutineWindow, getScheduleOccurrences } from "./calendar.ts";
-import { getFailureCooldownUntil, getInvalidDirectiveCooldownUntil } from "./ticketMachine.ts";
+import { getRoutineOccurrences, getRoutineWindow, getScheduleOccurrences } from "./calendar.ts";
+import {
+  getContextDurationLimit, getContextExclusion, getNextContextExpiry, mergeExecutionConstraints,
+  resolveEffectiveContext, userFatigueLabels, type UserContext,
+} from "./userContext.ts";
+import { createDirectiveAction, inferRoutineActionType } from "./directiveSentence.ts";
+import { getCurrentRoutineStep, type RoutineStepProgress } from "./routineProgress.ts";
+import { appendObjectParticle } from "./koreanParticle.ts";
+import { getFailureCooldownUntil, getInvalidDirectiveCooldownUntil, happinessEasterEggSourceId } from "./ticketMachine.ts";
+import {
+  getTaskRemainingMinutes,
+  isScheduleOccurrenceCompleted,
+  isScheduleOccurrencePrepared,
+  isTaskSourceCompleted,
+} from "./sourceCompletion.ts";
 import type {
   IdealRoutine,
   LocalScheduleItem,
@@ -20,12 +33,25 @@ export interface PlannerContext {
   idealRoutines: IdealRoutine[];
   recentTickets: Ticket[];
   settings: Settings;
+  userContext?: UserContext;
 }
 
 export interface PlannerPlan {
+  kind: "DIRECTIVE";
   candidate: TicketCandidate;
   decision: PlannerDecisionDraft;
 }
+
+/** Deferral is a normal outcome, not an invented fallback Ticket or an execution failure. */
+export interface DeferredPlannerPlan {
+  kind: "DEFERRED";
+  reason: string;
+  resumeAt?: string;
+  decision: PlannerDecisionDraft;
+}
+
+/** Every caller must explicitly handle the absence of a newly issued directive. */
+export type PlannerResult = PlannerPlan | DeferredPlannerPlan;
 
 export type DeadlineTier = TaskDeadlineTier;
 
@@ -43,6 +69,7 @@ interface PreparedTaskCandidate extends PreparedCandidate {
 
 interface PreparedRoutineCandidate extends PreparedCandidate {
   routine: IdealRoutine;
+  stepProgress?: RoutineStepProgress;
 }
 
 interface ResolutionAdjustment<TCandidate extends PreparedCandidate> {
@@ -57,14 +84,35 @@ const transitionBufferMinutes = 5;
 const minimumWorkMinutes = 5;
 const maximumWorkMinutes = 30;
 
-/** Ordered low-risk actions used when no registered Task, Routine, or Schedule can run. */
-const systemFallbacks: readonly TicketCandidate[] = [
-  { action: "주변을 5분간 정리할 것.", expectedMinutes: 5, sourceType: "SYSTEM", sourceId: "fallback:tidy" },
-  { action: "물을 한 잔 마실 것.", expectedMinutes: 2, sourceType: "SYSTEM", sourceId: "fallback:water" },
-  { action: "5분간 가볍게 걸을 것.", expectedMinutes: 5, sourceType: "SYSTEM", sourceId: "fallback:walk" },
-  { action: "5분간 잠시 휴식할 것.", expectedMinutes: 5, sourceType: "SYSTEM", sourceId: "fallback:rest" },
-  { action: "5분간 스트레칭할 것.", expectedMinutes: 5, sourceType: "SYSTEM", sourceId: "fallback:stretch" },
-];
+/** Finds the earliest upcoming fixed schedule or fixed-routine boundary used by all time calculations. */
+function getNextPlannerBoundary(
+  now: Date,
+  schedules: LocalScheduleItem[],
+  routines: IdealRoutine[],
+  tickets: Ticket[] = [],
+  userContext?: UserContext,
+): Date | undefined {
+  const rangeEnd = new Date(now.getTime() + 24 * 60 * minuteMs);
+  const nextSchedule = getScheduleOccurrences(schedules, now, rangeEnd)
+    .find((occurrence) => occurrence.startAt > now
+      && !isScheduleOccurrenceCompleted(occurrence.item, occurrence.startAt, tickets)
+      && !getContextExclusion(occurrence.item.executionConstraints, resolveEffectiveContext(userContext, occurrence.startAt)));
+  const nextRoutine = getRoutineOccurrences(routines, now, rangeEnd).find((occurrence) => {
+    if (occurrence.startAt <= now || occurrence.routine.timingMode !== "FIXED") return false;
+    const step = getCurrentRoutineStep(occurrence.routine, occurrence, tickets)?.step;
+    return !getContextExclusion(mergeExecutionConstraints(occurrence.routine.executionConstraints, step?.executionConstraints), resolveEffectiveContext(userContext, occurrence.startAt));
+  });
+  return [nextSchedule?.startAt, nextRoutine?.startAt]
+    .filter((value): value is Date => value !== undefined)
+    .sort((left, right) => left.getTime() - right.getTime())[0];
+}
+
+/** Maps the current minute and fallback history to one of 200 stable slots for a 0.5% Easter-egg chance. */
+function shouldIssueHappinessEasterEgg(now: Date, resolvedFallbackCount: number): boolean {
+  const minuteBucket = Math.floor(now.getTime() / minuteMs);
+  const slot = ((minuteBucket + Math.imul(resolvedFallbackCount, 97)) % 200 + 200) % 200;
+  return slot === 0;
+}
 
 /** Reports whether two instants belong to the same local calendar date. */
 function isSameLocalDay(left: Date, right: Date): boolean {
@@ -90,28 +138,23 @@ function compareSelectionTimes(left: number, right: number): number {
   return left < right ? -1 : 1;
 }
 
-/** Appends the natural Korean object particle while preserving a neutral fallback for other scripts. */
-function withObjectParticle(title: string): string {
-  const lastCharacter = title.trim().at(-1);
-  if (!lastCharacter) return title;
-  const codePoint = lastCharacter.charCodeAt(0);
-  if (codePoint < 0xac00 || codePoint > 0xd7a3) return `${title}을(를)`;
-  return `${title}${(codePoint - 0xac00) % 28 === 0 ? "를" : "을"}`;
-}
-
-/** Returns whole usable minutes, capped at 120, reserving five minutes before the next fixed schedule. */
-export function getAvailableWindow(now: Date, schedules: LocalScheduleItem[]): number {
-  const rangeEnd = new Date(now.getTime() + 24 * 60 * minuteMs);
-  const nextSchedule = getScheduleOccurrences(schedules, now, rangeEnd)
-    .find((occurrence) => occurrence.startAt > now);
-  if (!nextSchedule) return availableWindowLimitMinutes;
-  const minutesUntilNextSchedule = Math.floor((nextSchedule.startAt.getTime() - now.getTime()) / minuteMs);
-  return Math.max(0, Math.min(minutesUntilNextSchedule - transitionBufferMinutes, availableWindowLimitMinutes));
+/** Returns usable minutes before the earlier fixed schedule or routine boundary, reserving five minutes. */
+export function getAvailableWindow(
+  now: Date,
+  schedules: LocalScheduleItem[],
+  routines: IdealRoutine[] = [],
+  tickets: Ticket[] = [],
+  userContext?: UserContext,
+): number {
+  const nextBoundary = getNextPlannerBoundary(now, schedules, routines, tickets, userContext);
+  if (!nextBoundary) return availableWindowLimitMinutes;
+  const minutesUntilBoundary = Math.floor((nextBoundary.getTime() - now.getTime()) / minuteMs);
+  return Math.max(0, Math.min(minutesUntilBoundary - transitionBufferMinutes, availableWindowLimitMinutes));
 }
 
 /** Preserves the previous public helper name while delegating all calculation to getAvailableWindow. */
-export function getAvailableMinutes(now: Date, schedules: LocalScheduleItem[]): number {
-  return getAvailableWindow(now, schedules);
+export function getAvailableMinutes(now: Date, schedules: LocalScheduleItem[], routines: IdealRoutine[] = [], tickets: Ticket[] = []): number {
+  return getAvailableWindow(now, schedules, routines, tickets);
 }
 
 /** Converts a Task deadline into one of six explicit urgency tiers. */
@@ -187,17 +230,21 @@ function compareTicketResolutions(left: Ticket, right: Ticket): number {
 }
 
 /** Finds the latest meaningful resolution, optionally scoped to one original source identity. */
-function getLatestResolution(tickets: Ticket[], source?: Pick<TicketCandidate, "sourceType" | "sourceId">): Ticket | undefined {
+function getLatestResolution(
+  tickets: Ticket[],
+  source?: Pick<TicketCandidate, "sourceType" | "sourceId" | "routineStepId">,
+): Ticket | undefined {
   return tickets.filter((ticket) => (
     (ticket.status === "COMPLETED" || ticket.status === "FAILED" || ticket.status === "INVALID")
     && (!source || (ticket.sourceType === source.sourceType
-      && canonicalSourceId(ticket.sourceType, ticket.sourceId) === canonicalSourceId(source.sourceType, source.sourceId)))
+      && canonicalSourceId(ticket.sourceType, ticket.sourceId) === canonicalSourceId(source.sourceType, source.sourceId)
+      && (source.sourceType !== "ROUTINE" || ticket.routineStepId === source.routineStepId)))
   )).sort(compareTicketResolutions)[0];
 }
 
 /** Blocks registered sources during feedback cooldown and the immediately rejected System source. */
 function getInvalidSourceBlock(
-  source: Pick<TicketCandidate, "sourceType" | "sourceId">,
+  source: Pick<TicketCandidate, "sourceType" | "sourceId" | "routineStepId">,
   tickets: Ticket[],
   now: Date,
 ): string | null {
@@ -219,7 +266,23 @@ function applyRecentResolution<TCandidate extends PreparedCandidate>(
   candidate: TCandidate,
   tickets: Ticket[],
   now: Date,
+  userContext?: UserContext,
 ): ResolutionAdjustment<TCandidate> {
+  const effectiveContext = resolveEffectiveContext(userContext, now);
+  const contextBlock = getContextExclusion(candidate.candidate.executionConstraints, effectiveContext);
+  if (contextBlock) return { candidate: null, reason: `사용자 상태 · ${contextBlock}` };
+  if (candidate.candidate.actionType === "DURATION") {
+    const originalMinutes = candidate.candidate.expectedMinutes;
+    const adjustedMinutes = Math.min(originalMinutes, getContextDurationLimit(effectiveContext));
+    if (adjustedMinutes < originalMinutes) {
+      const adjustmentReason = `${userFatigueLabels[effectiveContext.fatigue]} · 수행 단위 ${originalMinutes}→${adjustedMinutes}분`;
+      candidate = { ...candidate, adjustmentReason, candidate: { ...candidate.candidate,
+        expectedMinutes: adjustedMinutes, originalExpectedMinutes: originalMinutes,
+        action: candidate.candidate.action.replace(/\d+분(?:간| 동안)/u, `${adjustedMinutes}분 동안`),
+        selectionReason: `${candidate.candidate.selectionReason ?? "실행 가능"} · ${adjustmentReason}`,
+      } };
+    }
+  }
   const invalidBlock = getInvalidSourceBlock(candidate.candidate, tickets, now);
   if (invalidBlock) return { candidate: null, reason: invalidBlock };
   // 품질 피드백은 별도 보류에만 사용하고 기존 수행 실패의 조정 이력을 대신하지 않습니다.
@@ -249,10 +312,10 @@ function applyRecentResolution<TCandidate extends PreparedCandidate>(
     return {
       candidate: {
         ...candidate,
-        adjustmentReason: `최근 실패 후 ${expectedMinutes}분으로 축소`,
+        adjustmentReason: [candidate.adjustmentReason, `최근 실패 후 ${expectedMinutes}분으로 축소`].filter(Boolean).join(" · "),
         candidate: {
           ...candidate.candidate,
-          action: candidate.candidate.action.replace(/\d+분간/, `${expectedMinutes}분간`),
+          action: candidate.candidate.action.replace(/\d+분(?:간| 동안)/, `${expectedMinutes}분 동안`),
           expectedMinutes,
           selectionReason,
         },
@@ -263,18 +326,17 @@ function applyRecentResolution<TCandidate extends PreparedCandidate>(
   return { candidate, reason: candidate.candidate.selectionReason ?? "실행 가능" };
 }
 
-/** Builds one Task candidate using only the shared available window for duration. */
+/** Requires five free minutes while allowing a one-through-four-minute final Task block. */
 function createTaskCandidate(
   task: Task,
   availableMinutes: number,
   now: Date,
   tickets: Ticket[],
 ): PreparedTaskCandidate | null {
-  const remainingMinutes = task.estimatedMinutes === undefined
-    ? 25
-    : Math.max(0, task.estimatedMinutes - task.completedMinutes);
+  if (isTaskSourceCompleted(task, tickets)) return null;
+  const remainingMinutes = getTaskRemainingMinutes(task, tickets);
   const expectedMinutes = Math.min(remainingMinutes, maximumWorkMinutes, availableMinutes);
-  if (task.status === "DONE" || expectedMinutes < minimumWorkMinutes) return null;
+  if (availableMinutes < minimumWorkMinutes || expectedMinutes < 1) return null;
   const deadlineTier = getDeadlineTier(task, now);
   return {
     task,
@@ -282,10 +344,12 @@ function createTaskCandidate(
     lastExecutedAt: getTaskLastExecutedAt(task.id, tickets),
     label: task.title,
     candidate: {
-      action: `${withObjectParticle(task.title)} ${expectedMinutes}분간 진행할 것.`,
+      action: `${expectedMinutes}분 동안 ${appendObjectParticle(task.title)} 진행할 것.`,
       expectedMinutes,
       sourceType: "TASK",
       sourceId: task.id,
+      executionConstraints: task.executionConstraints,
+      actionType: "DURATION",
       selectionReason: `${deadlineTier <= 3 ? "긴급 할 일" : "일반 할 일"} · ${getDeadlineTierLabel(task, deadlineTier)} · 중요도 ${task.importance} · 가용 ${availableMinutes}분`,
       deadline: task.dueAt,
       trigger: "지금,",
@@ -372,6 +436,7 @@ function createPlannerPlan(
       || compareStableIds(left.sourceId ?? left.label, right.sourceId ?? right.label))
     .slice(0, 20);
   return {
+    kind: "DIRECTIVE",
     candidate,
     decision: {
       evaluatedAt: context.now.toISOString(),
@@ -379,8 +444,19 @@ function createPlannerPlan(
       selectedAction: candidate.action,
       selectedReason: candidate.selectionReason ?? "Planner 계층 우선순위",
       candidates,
+      userContext: resolveEffectiveContext(context.userContext, context.now),
+      result: "DIRECTIVE",
     },
   };
+}
+
+/** Records why execution was deferred without issuing an artificial System action. */
+function createDeferredPlan(context: PlannerContext, availableMinutes: number, decisions: PlannerCandidateDecision[], reason: string): DeferredPlannerPlan {
+  const userContext = resolveEffectiveContext(context.userContext, context.now);
+  return { kind: "DEFERRED", reason, resumeAt: getNextContextExpiry(userContext, context.now), decision: {
+    evaluatedAt: context.now.toISOString(), availableMinutes, selectedAction: "지령 발행 보류", selectedReason: reason,
+    userContext, result: "DEFERRED", candidates: decisions.slice(0, 50),
+  } };
 }
 
 /** Marks remaining sources as intentionally skipped after a fixed schedule wins immediately. */
@@ -391,8 +467,18 @@ function appendPrioritySkippedDecisions(
   reason: string,
   context: PlannerContext,
 ): void {
-  for (const task of tasks) decisions.push(createTaskDecision(task, "SKIPPED", reason, context.now, context.recentTickets));
-  for (const routine of routines) decisions.push(createCandidateDecision("ROUTINE", routine.title, "SKIPPED", reason, routine.id, { priorityLayer: 4 }));
+  for (const task of tasks) {
+    const completed = isTaskSourceCompleted(task, context.recentTickets);
+    const blocked = getContextExclusion(task.executionConstraints, resolveEffectiveContext(context.userContext, context.now));
+    decisions.push(createTaskDecision(task, completed || blocked ? "EXCLUDED" : "SKIPPED",
+      completed ? "이미 완료된 Task 원본 또는 완료 이력" : blocked ? `사용자 상태 · ${blocked}` : reason, context.now, context.recentTickets));
+  }
+  for (const routine of routines) {
+    const window = resolveRoutineWindow(routine, context.now);
+    const step = window ? getCurrentRoutineStep(routine, window, context.recentTickets)?.step : undefined;
+    const blocked = getContextExclusion(mergeExecutionConstraints(routine.executionConstraints, step?.executionConstraints), resolveEffectiveContext(context.userContext, context.now));
+    decisions.push(createCandidateDecision("ROUTINE", routine.title, blocked ? "EXCLUDED" : "SKIPPED", blocked ? `사용자 상태 · ${blocked}` : reason, routine.id, { priorityLayer: 4 }));
+  }
 }
 
 /** Marks one candidate selected and optionally skips eligible candidates in lower tiers. */
@@ -416,15 +502,41 @@ function finalizeTierDecisions(
   }
 }
 
-/** Selects a fitting fallback deterministically, using passive waiting when the shared window is too short. */
-function selectSystemFallback(tickets: Ticket[], availableMinutes: number, now: Date, decisions: PlannerCandidateDecision[]): TicketCandidate {
+/** Selects a fitting configured fallback deterministically, using passive waiting when time is too short. */
+function selectSystemFallback(
+  tickets: Ticket[],
+  availableMinutes: number,
+  now: Date,
+  nextBoundaryAt: Date | undefined,
+  decisions: PlannerCandidateDecision[],
+  settings: Settings,
+  userContext: UserContext,
+): TicketCandidate | null {
+  const configuredFallbacks: TicketCandidate[] = settings.systemFallbacks.map((fallback) => ({
+    action: fallback.action, expectedMinutes: fallback.expectedMinutes, sourceType: "SYSTEM", sourceId: `fallback:${fallback.id}`,
+    executionConstraints: fallback.executionConstraints,
+    actionType: /\d+분(?:간| 동안)/u.test(fallback.action) ? "DURATION" : "COMPLETION",
+  }));
+  const allowedFallbacks = configuredFallbacks.filter((candidate) => {
+    const reason = getContextExclusion(candidate.executionConstraints, userContext);
+    if (!reason) return true;
+    decisions.push(createCandidateDecision("SYSTEM", candidate.action, "EXCLUDED", `사용자 상태 · ${reason}`, candidate.sourceId, { priorityLayer: 6 }));
+    return false;
+  });
+  if (configuredFallbacks.length > 0 && allowedFallbacks.length === 0) return null;
   if (availableMinutes < minimumWorkMinutes) {
+    const waitingMinutes = nextBoundaryAt
+      ? Math.max(1, Math.ceil((nextBoundaryAt.getTime() - now.getTime()) / minuteMs))
+      : Math.max(1, availableMinutes);
     const waiting: TicketCandidate = {
       action: "다음 일정에 대비해 잠시 대기할 것.",
-      expectedMinutes: Math.max(1, availableMinutes),
+      expectedMinutes: waitingMinutes,
       sourceType: "SYSTEM",
       sourceId: "system:wait-for-schedule",
-      selectionReason: "다음 일정 전 실행할 시간이 5분 미만이라 대기",
+      selectionReason: nextBoundaryAt
+        ? `${formatClock(nextBoundaryAt)} 다음 일정까지 ${waitingMinutes}분 남아 대기`
+        : "다음 일정 전 실행할 시간이 5분 미만이라 대기",
+      deadline: nextBoundaryAt?.toISOString(),
       trigger: "다음 일정이 가까우므로,",
     };
     const block = getInvalidSourceBlock(waiting, tickets, now);
@@ -432,10 +544,11 @@ function selectSystemFallback(tickets: Ticket[], availableMinutes: number, now: 
     decisions.push(createCandidateDecision("SYSTEM", waiting.action, "EXCLUDED", block, waiting.sourceId, { priorityLayer: 6 }));
     return {
       action: "잠시 호흡을 고르며 대기할 것.",
-      expectedMinutes: Math.max(1, availableMinutes),
+      expectedMinutes: waitingMinutes,
       sourceType: "SYSTEM",
       sourceId: "system:regain-composure",
       selectionReason: "직전 대기 지령이 부적절하다고 기록되어 다른 대기 행동 선택",
+      deadline: nextBoundaryAt?.toISOString(),
       trigger: "다음 일정이 가까우므로,",
     };
   }
@@ -444,12 +557,43 @@ function selectSystemFallback(tickets: Ticket[], availableMinutes: number, now: 
     && (ticket.sourceId === "reset-environment" || ticket.sourceId?.startsWith("fallback:"))
     && (ticket.status === "COMPLETED" || ticket.status === "FAILED" || ticket.status === "INVALID")
   )).length;
-  let selected = systemFallbacks[resolvedFallbackCount % systemFallbacks.length];
-  for (let offset = 0; offset < systemFallbacks.length; offset += 1) {
-    const candidate = systemFallbacks[(resolvedFallbackCount + offset) % systemFallbacks.length];
+  if (shouldIssueHappinessEasterEgg(now, resolvedFallbackCount)) {
+    return {
+      action: "행복할 것. 기간은 무제한",
+      expectedMinutes: 240,
+      sourceType: "SYSTEM",
+      sourceId: happinessEasterEggSourceId,
+      selectionReason: "System fallback 0.5% 이스터 에그",
+      trigger: "",
+    };
+  }
+  const fittingFallbacks = allowedFallbacks.filter((fallback) => fallback.expectedMinutes <= availableMinutes);
+  if (fittingFallbacks.length === 0) {
+    return {
+      action: "가용 시간 안에서 잠시 호흡을 고를 것.",
+      expectedMinutes: Math.max(1, availableMinutes),
+      sourceType: "SYSTEM",
+      sourceId: "system:no-fitting-fallback",
+      selectionReason: "설정한 System fallback의 예상 시간이 현재 가용시간보다 길어 짧은 대기 선택",
+      trigger: "지금 처리할 등록 항목이 없으므로,",
+    };
+  }
+  let selected: TicketCandidate | undefined;
+  for (let offset = 0; offset < fittingFallbacks.length; offset += 1) {
+    const candidate = fittingFallbacks[(resolvedFallbackCount + offset) % fittingFallbacks.length];
     const block = getInvalidSourceBlock(candidate, tickets, now);
     if (!block) { selected = candidate; break; }
     decisions.push(createCandidateDecision("SYSTEM", candidate.action, "EXCLUDED", block, candidate.sourceId, { priorityLayer: 6 }));
+  }
+  if (!selected) {
+    return {
+      action: "잠시 호흡을 고르며 다음 행동을 준비할 것.",
+      expectedMinutes: 3,
+      sourceType: "SYSTEM",
+      sourceId: "system:configured-fallbacks-blocked",
+      selectionReason: "설정한 fallback이 모두 직전 이상 지령 피드백으로 보류되어 임시 행동 선택",
+      trigger: "지금 처리할 등록 항목이 없으므로,",
+    };
   }
   return {
     ...selected,
@@ -459,13 +603,35 @@ function selectSystemFallback(tickets: Ticket[], availableMinutes: number, now: 
 }
 
 /** Chooses one action through explicit priority tiers and returns its deterministic audit trail. */
-export function planNextTicketWithDecision(context: PlannerContext): PlannerPlan {
+export function planNextTicketWithDecision(context: PlannerContext): PlannerResult {
   const { now, localSchedule, idealRoutines, recentTickets, tasks } = context;
   const decisions: PlannerCandidateDecision[] = [];
-  const availableMinutes = getAvailableWindow(now, localSchedule);
+  const effectiveContext = resolveEffectiveContext(context.userContext, now);
+  const availableMinutes = getAvailableWindow(now, localSchedule, idealRoutines, recentTickets, context.userContext);
+  const nextBoundaryAt = getNextPlannerBoundary(now, localSchedule, idealRoutines, recentTickets, context.userContext);
+  if (effectiveContext.activity === "UNAVAILABLE") {
+    const reason = "일시적으로 수행 불가 상태여서 새 실행 지령 발행을 보류합니다.";
+    for (const task of tasks) decisions.push(createTaskDecision(task, "EXCLUDED", reason, now, recentTickets));
+    for (const item of localSchedule) decisions.push(createCandidateDecision("SCHEDULE", item.title, "EXCLUDED", reason, item.id));
+    for (const routine of idealRoutines) decisions.push(createCandidateDecision("ROUTINE", routine.title, "EXCLUDED", reason, routine.id));
+    for (const fallback of context.settings.systemFallbacks) decisions.push(createCandidateDecision("SYSTEM", fallback.action, "EXCLUDED", reason, `fallback:${fallback.id}`));
+    return createDeferredPlan(context, availableMinutes, decisions, reason);
+  }
   const dayBefore = new Date(now.getTime() - 24 * 60 * minuteMs);
   const dayAfter = new Date(now.getTime() + 24 * 60 * minuteMs);
-  const occurrences = getScheduleOccurrences(localSchedule, dayBefore, dayAfter);
+  const occurrences = getScheduleOccurrences(localSchedule, dayBefore, dayAfter).filter((occurrence) => {
+    const block = getContextExclusion(occurrence.item.executionConstraints, effectiveContext);
+    if (block) {
+      decisions.push(createCandidateDecision("SCHEDULE", occurrence.item.title, "EXCLUDED", `사용자 상태 · ${block}`, occurrence.item.id));
+      return false;
+    }
+    if (!isScheduleOccurrenceCompleted(occurrence.item, occurrence.startAt, recentTickets)) return true;
+    decisions.push(createCandidateDecision("SCHEDULE", occurrence.item.title, "EXCLUDED",
+      "원본 일정의 해당 수행 회차가 이미 완료됨", occurrence.item.id, {
+        priorityLayer: occurrence.startAt <= now ? 1 : 2,
+      }));
+    return false;
+  });
 
   const activeSchedule = occurrences.find((occurrence) => occurrence.startAt <= now && now < occurrence.endAt);
   if (activeSchedule) {
@@ -473,16 +639,22 @@ export function planNextTicketWithDecision(context: PlannerContext): PlannerPlan
     const prepared: PreparedCandidate = {
       label: activeSchedule.item.title,
       candidate: {
-        action: `${activeSchedule.item.title} 일정에 집중할 것.`,
+        action: activeSchedule.item.type === "commute"
+          ? createDirectiveAction(activeSchedule.item.title, "MOVEMENT", remaining)
+          : `${activeSchedule.item.title} 일정에 집중할 것.`,
         expectedMinutes: remaining,
         sourceType: "SCHEDULE",
         sourceId: activeSchedule.item.id,
+        scheduleOccurrenceStartAt: activeSchedule.startAt.toISOString(),
+        schedulePhase: "EXECUTION",
+        executionConstraints: activeSchedule.item.executionConstraints,
+        actionType: activeSchedule.item.type === "commute" ? "MOVEMENT" : "COMPLETION",
         selectionReason: "현재 진행 중인 고정 일정이 있어 선택됨",
         deadline: activeSchedule.endAt.toISOString(),
         trigger: "현재 일정이 진행 중이므로,",
       },
     };
-    const adjusted = applyRecentResolution(prepared, recentTickets, now);
+    const adjusted = applyRecentResolution(prepared, recentTickets, now, context.userContext);
     if (adjusted.candidate) {
       decisions.push(createCandidateDecision("SCHEDULE", prepared.label, "SELECTED", adjusted.reason, prepared.candidate.sourceId, { priorityLayer: 1 }));
       appendPrioritySkippedDecisions(decisions, tasks, idealRoutines, "현재 진행 중인 고정 일정이 우선됨", context);
@@ -491,7 +663,13 @@ export function planNextTicketWithDecision(context: PlannerContext): PlannerPlan
     decisions.push(createCandidateDecision("SCHEDULE", prepared.label, "EXCLUDED", adjusted.reason, prepared.candidate.sourceId, { priorityLayer: 1 }));
   }
 
-  const nextSchedule = occurrences.find((occurrence) => occurrence.startAt > now);
+  const nextSchedule = occurrences.find((occurrence) => {
+    if (occurrence.startAt <= now) return false;
+    if (!isScheduleOccurrencePrepared(occurrence.item, occurrence.startAt, recentTickets)) return true;
+    decisions.push(createCandidateDecision("SCHEDULE", occurrence.item.title, "EXCLUDED",
+      "해당 회차의 일정 준비는 이미 완료됨 · 본 일정은 시작 시각에 다시 판단", occurrence.item.id, { priorityLayer: 2 }));
+    return false;
+  });
   if (nextSchedule) {
     const minutesUntil = Math.ceil((nextSchedule.startAt.getTime() - now.getTime()) / minuteMs);
     if (minutesUntil <= 15) {
@@ -502,12 +680,16 @@ export function planNextTicketWithDecision(context: PlannerContext): PlannerPlan
           expectedMinutes: Math.max(1, Math.min(10, minutesUntil)),
           sourceType: "SCHEDULE",
           sourceId: nextSchedule.item.id,
+          scheduleOccurrenceStartAt: nextSchedule.startAt.toISOString(),
+          schedulePhase: "PREPARATION",
+          executionConstraints: nextSchedule.item.executionConstraints,
+          actionType: "COMPLETION",
           selectionReason: "15분 안에 시작하는 고정 일정 준비가 필요하여 선택됨",
           deadline: nextSchedule.startAt.toISOString(),
           trigger: "곧 일정이 시작되므로,",
         },
       };
-      const adjusted = applyRecentResolution(prepared, recentTickets, now);
+      const adjusted = applyRecentResolution(prepared, recentTickets, now, context.userContext);
       if (adjusted.candidate) {
         decisions.push(createCandidateDecision("SCHEDULE", prepared.label, "SELECTED", adjusted.reason, prepared.candidate.sourceId, { priorityLayer: 2 }));
         appendPrioritySkippedDecisions(decisions, tasks, idealRoutines, "15분 안에 시작하는 일정 준비가 우선됨", context);
@@ -521,18 +703,20 @@ export function planNextTicketWithDecision(context: PlannerContext): PlannerPlan
   for (const task of tasks) {
     const prepared = createTaskCandidate(task, availableMinutes, now, recentTickets);
     if (!prepared) {
-      const reason = task.status === "DONE" ? "이미 완료된 Task" : "가용시간 또는 남은 시간이 5분 미만";
+      const reason = isTaskSourceCompleted(task, recentTickets)
+        ? "이미 완료된 Task 원본 또는 완료 이력" : "가용시간이 5분 미만이거나 남은 수행시간이 1분 미만";
       decisions.push(createTaskDecision(task, "EXCLUDED", reason, now, recentTickets));
       continue;
     }
-    const adjusted = applyRecentResolution(prepared, recentTickets, now);
+    const adjusted = applyRecentResolution(prepared, recentTickets, now, context.userContext);
     if (!adjusted.candidate) {
       decisions.push(createTaskDecision(task, "EXCLUDED", adjusted.reason, now, recentTickets));
       continue;
     }
     const candidate = adjusted.candidate;
     taskCandidates.push(candidate);
-    decisions.push(createTaskDecision(task, "ELIGIBLE", adjusted.reason, now, recentTickets));
+    decisions.push({ ...createTaskDecision(task, "ELIGIBLE", adjusted.reason, now, recentTickets),
+      originalMinutes: prepared.candidate.expectedMinutes, adjustedMinutes: candidate.candidate.expectedMinutes });
   }
   taskCandidates.sort(compareTaskCandidates);
   const urgentTasks = taskCandidates.filter((candidate) => candidate.deadlineTier <= 3);
@@ -545,37 +729,66 @@ export function planNextTicketWithDecision(context: PlannerContext): PlannerPlan
       decisions.push(createCandidateDecision("ROUTINE", routine.title, "EXCLUDED", routine.enabled ? "현재 루틴 시간대가 아님" : "비활성화된 루틴", routine.id, { priorityLayer: 4 }));
       continue;
     }
-    if (wasRoutineResolvedInWindow(routine.id, window, recentTickets)) {
+    const detailedStep = getCurrentRoutineStep(routine, window, recentTickets);
+    if ((routine.steps?.length ?? 0) > 0 && !detailedStep) {
+      decisions.push(createCandidateDecision("ROUTINE", routine.title, "EXCLUDED", "현재 루틴 구간의 상세 단계를 모두 완료함", routine.id, { priorityLayer: 4 }));
+      continue;
+    }
+    if ((routine.steps?.length ?? 0) === 0 && wasRoutineResolvedInWindow(routine.id, window, recentTickets)) {
       decisions.push(createCandidateDecision("ROUTINE", routine.title, "EXCLUDED", "현재 루틴 구간에서 이미 처리됨", routine.id, { priorityLayer: 4 }));
       continue;
     }
     const windowRemaining = Math.floor((window.endAt.getTime() - now.getTime()) / minuteMs);
-    const expectedMinutes = Math.min(maximumWorkMinutes, windowRemaining, availableMinutes);
-    if (expectedMinutes < minimumWorkMinutes) {
-      decisions.push(createCandidateDecision("ROUTINE", routine.title, "EXCLUDED", "가용시간 또는 루틴에 남은 시간이 5분 미만", routine.id, { priorityLayer: 4 }));
+    const requestedMinutes = detailedStep?.progress.remainingMinutes ?? maximumWorkMinutes;
+    const expectedMinutes = Math.min(requestedMinutes, maximumWorkMinutes, windowRemaining, availableMinutes);
+    const minimumRoutineMinutes = detailedStep ? 1 : minimumWorkMinutes;
+    if (expectedMinutes < minimumRoutineMinutes) {
+      decisions.push(createCandidateDecision(
+        "ROUTINE",
+        routine.title,
+        "EXCLUDED",
+        detailedStep ? "상세 단계를 실행할 시간이 남지 않음" : "가용시간 또는 루틴에 남은 시간이 5분 미만",
+        routine.id,
+        { priorityLayer: 4 },
+      ));
       continue;
     }
+    const actionTitle = detailedStep?.step.title ?? routine.title;
+    const actionType = detailedStep?.step.actionType ?? inferRoutineActionType(routine);
+    const stageReason = detailedStep
+      ? ` · 상세 단계 ${detailedStep.index + 1}/${routine.steps?.length ?? 0}`
+      : "";
     const prepared: PreparedRoutineCandidate = {
       routine,
+      stepProgress: detailedStep?.progress,
       label: routine.title,
       candidate: {
-        action: `${withObjectParticle(routine.title)} ${expectedMinutes}분간 수행할 것.`,
+        action: createDirectiveAction(actionTitle, actionType, expectedMinutes),
         expectedMinutes,
         sourceType: "ROUTINE",
         sourceId: routine.id,
-        selectionReason: `현재 루틴 시간대 · 우선순위 ${routine.priority} · 가용 ${availableMinutes}분`,
+        actionType,
+        executionConstraints: mergeExecutionConstraints(routine.executionConstraints, detailedStep?.step.executionConstraints),
+        selectionReason: `${routine.timingMode === "FIXED" ? "고정형" : "유연형"} 루틴 시간대${stageReason} · 우선순위 ${routine.priority} · 가용 ${availableMinutes}분`,
         deadline: window.endAt.toISOString(),
         trigger: "지금은 이 루틴의 시간대이므로,",
+        routineTitle: routine.title,
+        routineStepId: detailedStep?.step.id,
+        routineStepIndex: detailedStep ? detailedStep.index + 1 : 1,
+        routineStepCount: routine.steps?.length || 1,
+        routineOccurrenceStartAt: window.startAt.toISOString(),
+        routineOccurrenceEndAt: window.endAt.toISOString(),
       },
     };
-    const adjusted = applyRecentResolution(prepared, recentTickets, now);
+    const adjusted = applyRecentResolution(prepared, recentTickets, now, context.userContext);
     if (!adjusted.candidate) {
       decisions.push(createCandidateDecision("ROUTINE", routine.title, "EXCLUDED", adjusted.reason, routine.id, { priorityLayer: 4 }));
       continue;
     }
     const candidate = adjusted.candidate;
     routineCandidates.push(candidate);
-    decisions.push(createCandidateDecision("ROUTINE", routine.title, "ELIGIBLE", adjusted.reason, routine.id, { priorityLayer: 4 }));
+    decisions.push({ ...createCandidateDecision("ROUTINE", routine.title, "ELIGIBLE", adjusted.reason, routine.id, { priorityLayer: 4 }),
+      originalMinutes: prepared.candidate.expectedMinutes, adjustedMinutes: candidate.candidate.expectedMinutes });
   }
   routineCandidates.sort((left, right) => right.routine.priority - left.routine.priority
     || compareStableIds(left.routine.id, right.routine.id));
@@ -597,8 +810,13 @@ export function planNextTicketWithDecision(context: PlannerContext): PlannerPlan
 
   const routine = routineCandidates[0];
   if (routine) {
-    const baseReason = "현재 실행 가능한 루틴이 있으며 긴급 할 일이 없어 선택됨";
-    const reason = routine.adjustmentReason ? `${baseReason} · ${routine.adjustmentReason}` : baseReason;
+    const detailedStage = routine.candidate.routineStepCount && routine.candidate.routineStepCount > 1
+      ? ` · 상세 단계 ${routine.candidate.routineStepIndex}/${routine.candidate.routineStepCount}`
+      : "";
+    const baseReason = `현재 실행 가능한 ${routine.routine.timingMode === "FIXED" ? "고정형" : "유연형"} 루틴이 있으며 긴급 할 일이 없어 선택됨${detailedStage}`;
+    const progressReason = routine.candidate.actionType === "DURATION" && routine.stepProgress
+      ? ` · 단계 누적 ${routine.stepProgress.completedMinutes}/${routine.stepProgress.targetMinutes}분 · 남은 ${routine.stepProgress.remainingMinutes}분` : "";
+    const reason = `${baseReason}${progressReason}${routine.adjustmentReason ? ` · ${routine.adjustmentReason}` : ""}`;
     const selected = { ...routine.candidate, selectionReason: reason };
     finalizeTierDecisions(decisions, selected, reason, ["TASK"]);
     return createPlannerPlan(context, selected, availableMinutes, decisions);
@@ -612,12 +830,18 @@ export function planNextTicketWithDecision(context: PlannerContext): PlannerPlan
     return createPlannerPlan(context, selected, availableMinutes, decisions);
   }
 
-  const fallback = selectSystemFallback(recentTickets, availableMinutes, now, decisions);
-  decisions.push(createCandidateDecision("SYSTEM", fallback.action, "SELECTED", fallback.selectionReason ?? "실행 가능한 등록 항목 없음", fallback.sourceId, { priorityLayer: 6 }));
-  return createPlannerPlan(context, fallback, availableMinutes, decisions);
+  const fallback = selectSystemFallback(recentTickets, availableMinutes, now, nextBoundaryAt, decisions, context.settings, effectiveContext);
+  if (!fallback) return createDeferredPlan(context, availableMinutes, decisions, "현재 상태에서 수행 가능한 등록 행동과 System fallback이 없어 발행을 보류합니다.");
+  const adjustedFallback = applyRecentResolution({ label: fallback.action, candidate: fallback }, recentTickets, now, context.userContext);
+  if (!adjustedFallback.candidate) return createDeferredPlan(context, availableMinutes, decisions, adjustedFallback.reason);
+  const selectedFallback = adjustedFallback.candidate.candidate;
+  decisions.push({ ...createCandidateDecision("SYSTEM", selectedFallback.action, "SELECTED", selectedFallback.selectionReason ?? "실행 가능한 등록 항목 없음", selectedFallback.sourceId, { priorityLayer: 6 }),
+    originalMinutes: fallback.expectedMinutes, adjustedMinutes: selectedFallback.expectedMinutes });
+  return createPlannerPlan(context, selectedFallback, availableMinutes, decisions);
 }
 
 /** Chooses one deterministic current action while preserving the original Planner API. */
-export function planNextTicket(context: PlannerContext): TicketCandidate {
-  return planNextTicketWithDecision(context).candidate;
+export function planNextTicket(context: PlannerContext): TicketCandidate | null {
+  const result = planNextTicketWithDecision(context);
+  return result.kind === "DIRECTIVE" ? result.candidate : null;
 }

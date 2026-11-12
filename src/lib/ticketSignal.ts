@@ -14,6 +14,10 @@ export interface TicketPrintPlan {
 
 export const ticketSignalAssetPath = "/audio/limbus-beep.wav";
 export const ticketWaitLoopAssetPath = "/audio/limbus-beep-wait-loop.wav";
+export const failureAlertAssetPath = "/audio/failure-alert.wav";
+export const informationBeepAssetPath = "/audio/information-beep.wav";
+
+let activeInformationBeep: HTMLAudioElement | null = null;
 
 type OpeningSignalPlayer = () => Promise<void>;
 type WaitLoopPlayer = (untilSettled: Promise<void>) => Promise<void>;
@@ -166,6 +170,71 @@ export async function coordinateTicketSignal(
 /** Plays the opening sound and loops the supplied wait clip only for a delayed ticket transition. */
 export async function playTicketSignalUntilSettled(operation: Promise<unknown>): Promise<void> {
   await coordinateTicketSignal(operation, playTicketSignal, playReferenceWaitLoop);
+}
+
+/** Plays the user-provided failure alert to completion while reporting its normalized playback position. */
+export async function playFailureAlertSound(onProgress?: (progress: number) => void): Promise<boolean> {
+  if (typeof window === "undefined" || !window.Audio) return false;
+  const audio = new window.Audio(failureAlertAssetPath);
+  audio.preload = "auto";
+  audio.volume = 1;
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    let safetyTimer = 0;
+    let animationFrame = 0;
+    /** Samples the actual audio clock so visuals remain aligned if playback briefly stalls. */
+    function reportProgress() {
+      if (settled) return;
+      const duration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
+      onProgress?.(duration > 0 ? Math.min(1, Math.max(0.001, audio.currentTime / duration)) : 0.001);
+      animationFrame = window.requestAnimationFrame(reportProgress);
+    }
+    /** Finishes once and releases the audio element after completion or playback failure. */
+    function settle(didComplete: boolean) {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(safetyTimer);
+      window.cancelAnimationFrame(animationFrame);
+      onProgress?.(didComplete ? 1 : 0);
+      if (!didComplete) audio.pause();
+      resolve(didComplete);
+    }
+    audio.addEventListener("playing", reportProgress, { once: true });
+    audio.addEventListener("ended", () => settle(true), { once: true });
+    audio.addEventListener("error", () => settle(false), { once: true });
+    safetyTimer = window.setTimeout(() => settle(false), 10_000);
+    audio.play().catch(() => settle(false));
+  });
+}
+
+/** Plays the user-provided information beep, restarting it instead of stacking overlapping clicks. */
+export async function playInformationBeepSound(): Promise<boolean> {
+  if (typeof window === "undefined" || !window.Audio) return false;
+  if (activeInformationBeep) {
+    activeInformationBeep.pause();
+    activeInformationBeep.currentTime = 0;
+  }
+  const audio = new window.Audio(informationBeepAssetPath);
+  activeInformationBeep = audio;
+  audio.preload = "auto";
+  audio.volume = 0.8;
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    let safetyTimer = 0;
+    /** Releases only the current shared player so a later click cannot be cleared by an older callback. */
+    function settle(didComplete: boolean) {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(safetyTimer);
+      if (!didComplete) audio.pause();
+      if (activeInformationBeep === audio) activeInformationBeep = null;
+      resolve(didComplete);
+    }
+    audio.addEventListener("ended", () => settle(true), { once: true });
+    audio.addEventListener("error", () => settle(false), { once: true });
+    safetyTimer = window.setTimeout(() => settle(false), 5_000);
+    audio.play().catch(() => settle(false));
+  });
 }
 
 /** Synthesizes a filtered motor-and-paper sound while the issued ticket appears. */

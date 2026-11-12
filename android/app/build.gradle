@@ -1,5 +1,23 @@
 apply plugin: 'com.android.application'
 
+/** Pins personal APK builds to the backed-up key instead of generating a machine-specific debug key. */
+def directiveKeystore = rootProject.file('signing/directiveTerminal.keystore')
+if (!directiveKeystore.isFile()) {
+    throw new GradleException('Fixed Android signing key is missing: restore android/signing/directiveTerminal.keystore before building. Do not generate a replacement key.')
+}
+def directiveKeyAlias = 'androiddebugkey'
+def directiveStorePassword = 'android'
+def directiveKeyStore = java.security.KeyStore.getInstance(directiveKeystore, directiveStorePassword.toCharArray())
+def directiveCertificate = directiveKeyStore.getCertificate(directiveKeyAlias)
+if (directiveCertificate == null || !directiveKeyStore.isKeyEntry(directiveKeyAlias)) {
+    throw new GradleException('The fixed Android signing key does not contain the expected private-key entry.')
+}
+def directiveFingerprint = java.security.MessageDigest.getInstance('SHA-256')
+    .digest(directiveCertificate.encoded).encodeHex().toString()
+if (directiveFingerprint != '3ecf3515ec98277005128711c4c305b177982c7f20457056b55506dc3e8d83a2') {
+    throw new GradleException('Android signing identity changed. Restore the original fixed key to preserve update compatibility.')
+}
+
 android {
     namespace = "com.directive.terminal"
     compileSdk = rootProject.ext.compileSdkVersion
@@ -7,8 +25,8 @@ android {
         applicationId "com.directive.terminal"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        versionCode 4
+        versionName "1.0.3"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -16,7 +34,18 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    signingConfigs {
+        directiveTerminal {
+            storeFile directiveKeystore
+            storePassword directiveStorePassword
+            keyAlias directiveKeyAlias
+            keyPassword directiveStorePassword
+        }
+    }
     buildTypes {
+        debug {
+            signingConfig signingConfigs.directiveTerminal
+        }
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'

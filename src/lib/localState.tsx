@@ -1,12 +1,12 @@
 "use client";
 
-import { createContext, useContext, useEffect, useState } from "react";
+import { createContext, useContext, useEffect, useRef, useState } from "react";
 import {
   completeTicket,
+  continueTicket,
   createInitialState,
   failTicket,
   getActiveTicket,
-  issueTicket,
   type AppState,
   type FailureReason,
   type InvalidDirectiveReason,
@@ -16,8 +16,12 @@ import {
   type Task,
   type TransitionResult,
 } from "./ticketMachine";
-import { createIdealRoutine, createLocalScheduleItem } from "./calendar";
-import { planNextTicketWithDecision } from "./planner";
+import {
+  createIdealRoutine,
+  createLocalScheduleItem,
+  getNextRoutineOccurrence,
+  type RoutineOccurrence,
+} from "./calendar";
 import {
   createStateBackup,
   currentStorageKey,
@@ -26,15 +30,28 @@ import {
   parseV2State,
   previousStorageKey,
 } from "./stateMigration";
-import { resolveAndReissueTicket } from "./ticketLifecycle";
-import { syncNativeExperience } from "./nativeBridge";
+import { planAndIssueTicket, replanForUserContext, resolveAndReissueTicket, saveUserContextState } from "./ticketLifecycle";
+import { contextDirectiveIssuedEvent, getNextContextExpiry, resolveEffectiveContext, type UserContext } from "./userContext";
+import {
+  addRoutineNotificationActionListener,
+  cancelRoutineStartNotification,
+  findRoutineForNotification,
+  sendRoutineStartNotification,
+  syncNativeExperience,
+} from "./nativeBridge";
 
 const lockKey = "ticketPlannerState";
 
 interface LocalStateContextValue {
   state: AppState | null;
+  /** Stores context while preserving ACTIVE until explicit cancellation confirmation. */
+  saveUserContext: (context: UserContext) => Promise<boolean>;
+  /** Resolves a context conflict as cancellation, not FAILED or INVALID. */
+  replanUserContext: (ticketId: string) => Promise<boolean>;
   issue: () => Promise<boolean>;
   complete: (id: string) => Promise<boolean>;
+  /** Keeps the directive ACTIVE while extending only its expected-end confirmation. */
+  continueActive: (id: string, extensionMinutes?: number) => Promise<boolean>;
   fail: (id: string, reason: FailureReason) => Promise<boolean>;
   completeAndReissue: (id: string) => Promise<boolean>;
   failAndReissue: (id: string, reason: FailureReason) => Promise<boolean>;
@@ -45,13 +62,19 @@ interface LocalStateContextValue {
   updateTask: (id: string, task: Omit<Task, "id">) => Promise<string | null>;
   toggleTask: (id: string) => Promise<void>;
   removeTask: (id: string) => Promise<void>;
+  /** Restores a recently deleted task with its original source identity. */
+  restoreTask: (task: Task) => Promise<string | null>;
   addLocalScheduleItem: (item: Omit<LocalScheduleItem, "id">) => Promise<string | null>;
   removeLocalScheduleItem: (id: string) => Promise<void>;
   addIdealRoutine: (routine: Omit<IdealRoutine, "id">) => Promise<string | null>;
   /** Updates one saved routine after validating overlapping weekdays and start times. */
   updateIdealRoutine: (id: string, routine: Omit<IdealRoutine, "id">) => Promise<string | null>;
+  /** Atomically applies one confirmed routine-editor preview without touching ACTIVE state. */
+  applyIdealRoutineBatch: (routines: IdealRoutine[]) => Promise<string | null>;
   toggleIdealRoutine: (id: string) => Promise<void>;
   removeIdealRoutine: (id: string) => Promise<void>;
+  /** Restores a recently deleted routine with its original source identity. */
+  restoreIdealRoutine: (routine: IdealRoutine) => Promise<string | null>;
   updateSettings: (settings: Settings) => Promise<void>;
   /** Serializes the latest persisted application state for portable backup. */
   exportBackup: () => string;
@@ -82,6 +105,11 @@ function createRoutineIdentity(item: IdealRoutine): string {
     [...item.daysOfWeek].sort((left, right) => left - right),
     item.category,
     item.priority,
+    item.timingMode,
+    item.executionConstraints,
+    Boolean(item.locked),
+    (item.steps ?? []).map((step) => [step.title.trim(), step.actionType, step.expectedMinutes, step.executionConstraints]),
+    (item.dateOverrides ?? []).map((override) => [override.dateKey, override.startTime, override.endTime ?? "", override.startDayOffset ?? 0]),
   ]);
 }
 
@@ -123,6 +151,11 @@ function deduplicateRoutines(state: AppState): AppState {
     : { ...state, idealRoutines };
 }
 
+/** Runs the deterministic Planner only when no ACTIVE directive exists, preserving the state-machine invariant. */
+function planAndIssueCurrentState(current: AppState, now: Date, ticketId: string): TransitionResult {
+  return planAndIssueTicket(current, now, ticketId);
+}
+
 /** Reads v0.2 data or migrates v0.1 data before allowing any state write. */
 function readState(): AppState {
   const saved = window.localStorage.getItem(currentStorageKey);
@@ -155,6 +188,8 @@ async function withStateLock<T>(callback: () => T): Promise<T> {
 export function LocalStateProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<AppState | null>(null);
   const [storageError, setStorageError] = useState("");
+  const previousActiveTicketId = useRef<string | null | undefined>(undefined);
+  const hasSyncedContextOnEntry = useRef(false);
 
   useEffect(() => {
     try {
@@ -177,7 +212,86 @@ export function LocalStateProvider({ children }: { children: React.ReactNode }) 
   }, []);
 
   useEffect(() => {
-    if (state) void syncNativeExperience(state);
+    if (!state) return;
+    const activeTicketId = getActiveTicket(state)?.id ?? null;
+    const issuedTicketId = previousActiveTicketId.current !== undefined
+      && activeTicketId !== null
+      && activeTicketId !== previousActiveTicketId.current
+      ? activeTicketId
+      : undefined;
+    previousActiveTicketId.current = activeTicketId;
+    void syncNativeExperience(state, { issuedTicketId });
+  }, [state]);
+
+  useEffect(() => {
+    let isDisposed = false;
+    let removeListener: (() => Promise<void>) | undefined;
+    void addRoutineNotificationActionListener(async ({ routineId }) => {
+      const current = readState();
+      if (!findRoutineForNotification(current, routineId)) return;
+      if (!getActiveTicket(current)) {
+        const issued = await transition((latest) => planAndIssueCurrentState(latest, new Date(), crypto.randomUUID()));
+        if (issued) {
+          const latest = readState();
+          const issuedTicketId = getActiveTicket(latest)?.id;
+          await syncNativeExperience(latest, { issuedTicketId });
+        }
+      }
+      window.location.href = "/";
+    }).then((remove) => {
+      if (isDisposed) void remove();
+      else removeListener = remove;
+    });
+    return () => {
+      isDisposed = true;
+      if (removeListener) void removeListener();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!state) return;
+    const occurrence = getNextRoutineOccurrence(state.idealRoutines, new Date());
+    if (!occurrence) return;
+    const boundaryDelay = Math.max(0, occurrence.startAt.getTime() - Date.now());
+    const boundaryTimer = window.setTimeout(() => {
+      if (document.visibilityState === "visible") void handleForegroundRoutineBoundary(occurrence);
+    }, boundaryDelay);
+    return () => window.clearTimeout(boundaryTimer);
+  }, [state]);
+
+  useEffect(() => {
+    if (!state) return;
+    const expiry = getNextContextExpiry(state.userContext, new Date());
+    /** Reconciles saved context on foreground return or expiration without replacing an existing ACTIVE. */
+    async function refreshContext() {
+      if (document.visibilityState !== "visible") return;
+      try {
+        await transitionWithContextSignal((current) => {
+          const now = new Date();
+          const effective = resolveEffectiveContext(current.userContext, now);
+          const changed = JSON.stringify(effective) !== JSON.stringify(current.userContext);
+          const next = changed ? { ...current, userContext: effective } : current;
+          if (!getActiveTicket(next) && (changed || next.plannerDeferral)) return planAndIssueCurrentState(next, now, crypto.randomUUID());
+          return { kind: "success", state: next };
+        });
+      } catch {
+        setStorageError("현재 상태와 알림을 동기화하지 못했습니다. 앱을 다시 열어 주세요.");
+      }
+    }
+    const timer = expiry ? window.setTimeout(() => void refreshContext(), Math.min(2_147_000_000, Math.max(0, new Date(expiry).getTime() - Date.now()))) : undefined;
+    if (!hasSyncedContextOnEntry.current) {
+      hasSyncedContextOnEntry.current = true;
+      void refreshContext();
+    }
+    window.addEventListener("focus", refreshContext);
+    window.addEventListener("pageshow", refreshContext);
+    document.addEventListener("visibilitychange", refreshContext);
+    return () => {
+      if (timer !== undefined) window.clearTimeout(timer);
+      window.removeEventListener("focus", refreshContext);
+      window.removeEventListener("pageshow", refreshContext);
+      document.removeEventListener("visibilitychange", refreshContext);
+    };
   }, [state]);
 
   /** Applies a state-machine transition to the latest saved state. */
@@ -194,6 +308,21 @@ export function LocalStateProvider({ children }: { children: React.ReactNode }) 
     });
   }
 
+  /** Announces only an actually persisted context-driven ACTIVE, allowing the main screen to play its issue sound. */
+  async function transitionWithContextSignal(operation: (current: AppState) => TransitionResult): Promise<boolean> {
+    let issuedTicketId: string | undefined;
+    const success = await transition((current) => {
+      const result = operation(current);
+      if (result.kind === "success") {
+        const nextActive = getActiveTicket(result.state);
+        if (nextActive && nextActive.id !== getActiveTicket(current)?.id) issuedTicketId = nextActive.id;
+      }
+      return result;
+    });
+    if (success && issuedTicketId) window.dispatchEvent(new CustomEvent(contextDirectiveIssuedEvent, { detail: { ticketId: issuedTicketId } }));
+    return success;
+  }
+
   /** Persists a calendar, task, or settings edit against the latest state. */
   async function update(change: (current: AppState) => AppState): Promise<void> {
     await withStateLock(() => {
@@ -203,23 +332,30 @@ export function LocalStateProvider({ children }: { children: React.ReactNode }) 
     });
   }
 
+  /** Replans at a visible routine boundary, or emits information when an ACTIVE directive must be retained. */
+  async function handleForegroundRoutineBoundary(occurrence: RoutineOccurrence): Promise<void> {
+    try {
+      await cancelRoutineStartNotification(occurrence.routine.id, occurrence.startAt);
+    } catch {
+      console.warn("Routine notification cancellation failed before foreground planning.");
+    }
+    if (document.visibilityState !== "visible") {
+      await sendRoutineStartNotification(occurrence);
+      return;
+    }
+    const issued = await transition((current) => planAndIssueCurrentState(current, new Date(), crypto.randomUUID()));
+    if (!issued || !getActiveTicket(readState())) await sendRoutineStartNotification(occurrence);
+  }
+
   const value: LocalStateContextValue = {
     state,
-    issue: () => transition((current) => {
-      // ACTIVE 지령이 있으면 다음 행동을 계산하기 전 상태 전이를 거부합니다.
-      if (getActiveTicket(current)) return { kind: "conflict", state: current };
-      const now = new Date();
-      const plan = planNextTicketWithDecision({
-        now,
-        tasks: current.tasks,
-        localSchedule: current.localScheduleItems,
-        idealRoutines: current.idealRoutines,
-        recentTickets: current.tickets,
-        settings: current.settings,
-      });
-      return issueTicket(current, plan.candidate, now, crypto.randomUUID(), plan.decision);
-    }),
+    saveUserContext: (context) => transitionWithContextSignal((current) => saveUserContextState(current, context, new Date(), crypto.randomUUID())),
+    replanUserContext: (ticketId) => transition((current) => replanForUserContext(current, ticketId, new Date(), crypto.randomUUID())),
+    issue: () => transition((current) => planAndIssueCurrentState(current, new Date(), crypto.randomUUID())),
     complete: (id) => transition((current) => completeTicket(current, id, new Date())),
+    continueActive: (id, extensionMinutes = 10) => transition((current) => (
+      continueTicket(current, id, new Date(), extensionMinutes)
+    )),
     fail: (id, reason) => transition((current) => failTicket(current, id, reason, new Date())),
     completeAndReissue: (id) => transition((current) => {
       const now = new Date();
@@ -246,7 +382,7 @@ export function LocalStateProvider({ children }: { children: React.ReactNode }) 
       });
       return conflictMessage;
     },
-    /** Updates one saved task while retaining its identity and accumulated progress. */
+    /** Edits Task details without overwriting completion, progress, or the explicitly reopened work cycle. */
     updateTask: async (id, task) => {
       let conflictMessage: string | null = null;
       await update((current) => {
@@ -261,16 +397,43 @@ export function LocalStateProvider({ children }: { children: React.ReactNode }) 
         }
         return {
           ...current,
-          tasks: current.tasks.map((saved) => saved.id === id ? { ...task, id } : saved),
+          tasks: current.tasks.map((saved) => saved.id === id ? {
+            ...saved,
+            ...task,
+            id,
+            status: saved.status,
+            completedMinutes: saved.completedMinutes,
+            completedAt: saved.completedAt,
+            reopenedAt: saved.reopenedAt,
+          } : saved),
         };
       });
       return conflictMessage;
     },
-    toggleTask: (id) => update((current) => ({
-      ...current,
-      tasks: current.tasks.map((task) => task.id === id ? { ...task, status: task.status === "DONE" ? "TODO" : "DONE" } : task),
-    })),
+    /** Reopens an explicit new work cycle while keeping all earlier Ticket history intact. */
+    toggleTask: (id) => update((current) => {
+      const changedAt = new Date().toISOString();
+      return {
+        ...current,
+        tasks: current.tasks.map((task) => task.id !== id ? task : task.status === "DONE"
+          ? { ...task, status: "TODO", completedMinutes: 0, completedAt: undefined, reopenedAt: changedAt }
+          : { ...task, status: "DONE", completedAt: changedAt }),
+      };
+    }),
     removeTask: (id) => update((current) => ({ ...current, tasks: current.tasks.filter((task) => task.id !== id) })),
+    /** Restores one deleted Task unless a new item now occupies the same ID or explicit deadline. */
+    restoreTask: async (task) => {
+      let conflictMessage: string | null = null;
+      await update((current) => {
+        if (current.tasks.some((saved) => saved.id === task.id)) return current;
+        if (current.tasks.some((saved) => hasTaskTimeConflict(saved, task))) {
+          conflictMessage = "같은 날짜와 시간에 다른 할 일이 등록되어 복원하지 못했습니다.";
+          return current;
+        }
+        return { ...current, tasks: [...current.tasks, task] };
+      });
+      return conflictMessage;
+    },
     addLocalScheduleItem: async (item) => {
       const result = createLocalScheduleItem(item, crypto.randomUUID());
       if (result.kind === "invalid") return result.message;
@@ -326,11 +489,53 @@ export function LocalStateProvider({ children }: { children: React.ReactNode }) 
       });
       return conflictMessage;
     },
+    /** Validates and stores a complete routine list so chained time changes cannot be partially applied. */
+    applyIdealRoutineBatch: async (routines) => {
+      let errorMessage: string | null = null;
+      await update((current) => {
+        const currentIds = new Set(current.idealRoutines.map((routine) => routine.id));
+        const incomingIds = new Set(routines.map((routine) => routine.id));
+        if (routines.length !== current.idealRoutines.length || incomingIds.size !== routines.length ||
+            [...currentIds].some((id) => !incomingIds.has(id))) {
+          errorMessage = "루틴 목록이 변경되어 일괄 적용하지 못했습니다. 다시 미리보기 해주세요.";
+          return current;
+        }
+        const validated: IdealRoutine[] = [];
+        for (const routine of routines) {
+          const { id, ...draft } = routine;
+          const result = createIdealRoutine(draft, id);
+          if (result.kind === "invalid") {
+            errorMessage = result.message;
+            return current;
+          }
+          validated.push(result.value);
+        }
+        return { ...current, idealRoutines: validated };
+      });
+      return errorMessage;
+    },
     toggleIdealRoutine: (id) => update((current) => ({
       ...current,
       idealRoutines: current.idealRoutines.map((routine) => routine.id === id ? { ...routine, enabled: !routine.enabled } : routine),
     })),
     removeIdealRoutine: (id) => update((current) => ({ ...current, idealRoutines: current.idealRoutines.filter((routine) => routine.id !== id) })),
+    /** Restores one deleted Routine unless a new routine now occupies its weekday and start time. */
+    restoreIdealRoutine: async (routine) => {
+      let conflictMessage: string | null = null;
+      await update((current) => {
+        if (current.idealRoutines.some((saved) => saved.id === routine.id)) return current;
+        const hasTimeConflict = current.idealRoutines.some((saved) => (
+          saved.startTime === routine.startTime
+          && hasSharedRoutineDay(saved.daysOfWeek, routine.daysOfWeek)
+        ));
+        if (hasTimeConflict) {
+          conflictMessage = "같은 요일과 시작 시간에 다른 루틴이 등록되어 복원하지 못했습니다.";
+          return current;
+        }
+        return { ...current, idealRoutines: [...current.idealRoutines, routine] };
+      });
+      return conflictMessage;
+    },
     updateSettings: (settings) => update((current) => ({ ...current, settings })),
     /** Serializes the latest persisted state into a portable, versioned backup. */
     exportBackup: () => JSON.stringify(createStateBackup(readState(), new Date()), null, 2),

@@ -1,7 +1,10 @@
 package com.directive.terminal;
 
+import android.appwidget.AppWidgetManager;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.os.Build;
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
@@ -42,6 +45,26 @@ public class CalendarWidgetPlugin extends Plugin {
         if (!saved) { call.reject("Calendar widget snapshot could not be saved."); return; }
         CalendarWidgetProvider.updateAllWidgets(getContext());
         call.resolve();
+    }
+
+    /** Requests a real home-screen widget pin instead of creating an application shortcut. */
+    @PluginMethod
+    public void pin(PluginCall call) {
+        JSObject result = new JSObject();
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            result.put("supported", false);
+            result.put("requested", false);
+            call.resolve(result);
+            return;
+        }
+        AppWidgetManager manager = AppWidgetManager.getInstance(getContext());
+        boolean supported = manager.isRequestPinAppWidgetSupported();
+        boolean requested = supported && manager.requestPinAppWidget(
+            new ComponentName(getContext(), CalendarWidgetProvider.class), null, null
+        );
+        result.put("supported", supported);
+        result.put("requested", requested);
+        call.resolve(result);
     }
 
     /** Returns a pending request without consuming it, so effect cleanup cannot lose the launch. */

@@ -11,7 +11,7 @@ export function createAndroidNotificationChannel(): Channel {
   return {
     id: notificationChannelId,
     name: "지령 및 루틴",
-    description: "지령 종료 예상 시각과 루틴 시작을 지정된 비프음으로 알립니다.",
+    description: "지령 발급·종료 확인과 루틴 시작을 지정된 비프음으로 알립니다.",
     importance: 4,
     visibility: 1,
     vibration: true,

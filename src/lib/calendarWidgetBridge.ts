@@ -4,6 +4,7 @@ import type { CalendarWidgetDay } from "./calendarWidget";
 /** Android bridge for read-only widget snapshots and acknowledged launch requests. */
 interface CalendarWidgetPlugin {
   sync(options: { days: CalendarWidgetDay[] }): Promise<void>;
+  pin(): Promise<{ supported: boolean; requested: boolean }>;
   getLaunchRequest(): Promise<{ request: unknown }>;
   acknowledgeLaunch(options: { requestId: string }): Promise<{ acknowledged: boolean }>;
   addListener(eventName: "calendarLaunch", listener: (request: unknown) => void): Promise<PluginListenerHandle>;

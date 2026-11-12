@@ -1,7 +1,10 @@
 "use client";
 
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { DeletionUndoToast } from "@/components/DeletionUndoToast";
 import { PageHeading } from "@/components/PageHeading";
+import { ExecutionConstraintsEditor } from "@/components/ExecutionConstraintsEditor";
+import type { ExecutionConstraints } from "@/lib/userContext";
 import { useLocalState } from "@/lib/localState";
 import type { FailureReason, Task, Ticket } from "@/lib/ticketMachine";
 import { parseCalendarWidgetDate, parseCalendarWidgetQuery } from "@/lib/calendarWidget";
@@ -103,7 +106,7 @@ function createDailyExecutionCounts(tickets: Ticket[]): Map<string, { completed:
 
 /** Presents the calendar beside date details on landscape phones and keeps editor dialogs within the viewport. */
 export default function TasksPage() {
-  const { state, addTask, updateTask, toggleTask, removeTask } = useLocalState();
+  const { state, addTask, updateTask, toggleTask, removeTask, restoreTask } = useLocalState();
   const [viewMonth, setViewMonth] = useState(() => {
     const today = new Date();
     return new Date(today.getFullYear(), today.getMonth(), 1);
@@ -114,12 +117,15 @@ export default function TasksPage() {
   const [category, setCategory] = useState<Task["category"]>("personal");
   const [importance, setImportance] = useState<Task["importance"]>(3);
   const [estimatedMinutes, setEstimatedMinutes] = useState("");
+  const [executionConstraints, setExecutionConstraints] = useState<ExecutionConstraints>();
   const [isTaskModalOpen, setIsTaskModalOpen] = useState(false);
   const [editingTaskId, setEditingTaskId] = useState<string | null>(null);
   const [message, setMessage] = useState("");
   const [taskError, setTaskError] = useState("");
   const [historyFilter, setHistoryFilter] = useState<"COMPLETED" | "FAILED" | null>(null);
   const [isHistoryModalOpen, setIsHistoryModalOpen] = useState(false);
+  const [deletedTask, setDeletedTask] = useState<Task | null>(null);
+  const deletionTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     const request = parseCalendarWidgetQuery(window.location.search);
@@ -134,6 +140,10 @@ export default function TasksPage() {
     const url = new URL(window.location.href);
     for (const key of ["widgetDate", "widgetRequestId", "newTask"]) url.searchParams.delete(key);
     window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+  }, []);
+
+  useEffect(() => () => {
+    if (deletionTimerRef.current !== null) window.clearTimeout(deletionTimerRef.current);
   }, []);
 
   const calendarDays = useMemo(() => createMonthGridDays(viewMonth), [viewMonth]);
@@ -165,6 +175,28 @@ export default function TasksPage() {
     .sort((left, right) => (right.completedAt ?? "").localeCompare(left.completedAt ?? ""));
   const selectedExecutionCounts = dailyExecutionCounts.get(selectedDateKey) ?? { completed: 0, failed: 0 };
 
+  /** Deletes one Task immediately and keeps its original identity available for five-second recovery. */
+  async function handleRemoveTask(task: Task) {
+    await removeTask(task.id);
+    if (deletionTimerRef.current !== null) window.clearTimeout(deletionTimerRef.current);
+    setDeletedTask(task);
+    deletionTimerRef.current = window.setTimeout(() => {
+      setDeletedTask(null);
+      deletionTimerRef.current = null;
+    }, 5_000);
+  }
+
+  /** Restores the latest deleted Task unless a conflicting deadline was created in the meantime. */
+  async function handleUndoTaskDeletion() {
+    if (!deletedTask) return;
+    if (deletionTimerRef.current !== null) window.clearTimeout(deletionTimerRef.current);
+    deletionTimerRef.current = null;
+    const task = deletedTask;
+    setDeletedTask(null);
+    const error = await restoreTask(task);
+    setMessage(error ?? `‘${task.title}’ 할 일을 복원했습니다.`);
+  }
+
   /** Selects a day and prepares the input form for that calendar date. */
   function selectDate(date: Date) {
     setSelectedDate(date);
@@ -178,6 +210,7 @@ export default function TasksPage() {
   function openTaskModal(date: Date) {
     selectDate(date);
     setEditingTaskId(null);
+    setExecutionConstraints(undefined);
     setTitle("");
     setEstimatedMinutes("");
     setCategory("personal");
@@ -191,6 +224,7 @@ export default function TasksPage() {
     const taskDate = task.dueAt ? new Date(task.dueAt) : selectedDate;
     if (!Number.isNaN(taskDate.getTime())) selectDate(taskDate);
     setEditingTaskId(task.id);
+    setExecutionConstraints(task.executionConstraints);
     setTitle(task.title);
     setDueAt(toDateTimeLocalValue(task.dueAt));
     setEstimatedMinutes(task.estimatedMinutes?.toString() ?? "");
@@ -238,6 +272,7 @@ export default function TasksPage() {
         category,
         status: existingTask?.status ?? "TODO",
         completedMinutes: existingTask?.completedMinutes ?? 0,
+        executionConstraints,
       } satisfies Omit<Task, "id">;
       const error = editingTaskId
         ? await updateTask(editingTaskId, draft)
@@ -346,7 +381,7 @@ export default function TasksPage() {
                       <p className={`break-words text-sm font-semibold ${task.status === "DONE" ? "text-[#567287] line-through" : "text-[#5cd0ff]"}`}>{task.title}</p>
                       <p className="mt-1 text-[11px] text-[#1c7ba6]">{formatTaskTime(task.dueAt)} · {getCategory(task.category).label} · 중요도 {task.importance}</p>
                     </button>
-                    <button type="button" aria-label={`${task.title} 삭제`} className="min-h-8 border border-[#165b80] px-2 text-[10px] text-[#1c7ba6] hover:border-[#2fbffc] hover:text-[#5cd0ff]" onClick={() => void removeTask(task.id)}>삭제</button>
+                    <button type="button" aria-label={`${task.title} 삭제`} className="min-h-8 border border-[#165b80] px-2 text-[10px] text-[#1c7ba6] hover:border-[#2fbffc] hover:text-[#5cd0ff]" onClick={() => void handleRemoveTask(task)}>삭제</button>
                   </li>
                 ))}
               </ul>
@@ -373,6 +408,7 @@ export default function TasksPage() {
               <label className="block text-sm font-bold">할 일<input autoFocus required maxLength={120} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="예: 보고서 초안 작성" className="terminalField mt-2" /></label>
               <label className="block text-sm font-bold">마감일<input type="datetime-local" value={dueAt} onChange={(event) => setDueAt(event.target.value)} className="terminalField mt-2" /></label>
               <label className="block text-sm font-bold">예상 소요시간 (분)<input type="number" min="5" max="1440" step="5" value={estimatedMinutes} onChange={(event) => setEstimatedMinutes(event.target.value)} placeholder="예: 120" className="terminalField mt-2" /></label>
+              <ExecutionConstraintsEditor value={executionConstraints} onChange={setExecutionConstraints} />
               <div className="grid grid-cols-2 gap-3">
                 <label className="block text-sm font-bold">분류<select value={category} onChange={(event) => setCategory(event.target.value as Task["category"])} className="terminalField mt-2">{categories.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></label>
                 <label className="block text-sm font-bold">중요도<select value={importance} onChange={(event) => setImportance(Number(event.target.value) as Task["importance"])} className="terminalField mt-2">{[1, 2, 3, 4, 5].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
@@ -419,6 +455,7 @@ export default function TasksPage() {
           </section>
         </div>
       )}
+      {deletedTask && <DeletionUndoToast label={`‘${deletedTask.title}’ 할 일을 삭제했습니다.`} onUndo={() => void handleUndoTaskDeletion()} />}
     </div>
   );
 }

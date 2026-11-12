@@ -11,15 +11,19 @@ interface DecryptingTextProps {
 /** Sets a slightly slower cadence so each decrypted character remains legible. */
 const decryptionStepMs = 44;
 
-/** Reveals a directive sentence from terminal glyphs while keeping the original text accessible. */
+/** Reveals accessible text from terminal glyphs and marks completion for a single phosphor-settling effect. */
 export function DecryptingText({ text, delayMs = 0 }: DecryptingTextProps) {
   const [displayText, setDisplayText] = useState(text);
   const [isVisible, setIsVisible] = useState(false);
+  const [isDecrypted, setIsDecrypted] = useState(false);
 
   useEffect(() => {
+    setIsVisible(false);
+    setIsDecrypted(false);
     if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
       setDisplayText(text);
       setIsVisible(true);
+      setIsDecrypted(true);
       return undefined;
     }
 
@@ -33,6 +37,7 @@ export function DecryptingText({ text, delayMs = 0 }: DecryptingTextProps) {
         revealedCharacters += 1;
         if (revealedCharacters >= Array.from(text).length) {
           setDisplayText(text);
+          setIsDecrypted(true);
           window.clearInterval(timer);
           return;
         }
@@ -49,7 +54,7 @@ export function DecryptingText({ text, delayMs = 0 }: DecryptingTextProps) {
   return (
     <span className={`transition-opacity duration-75 ${isVisible ? "opacity-100" : "opacity-0"}`}>
       <span className="sr-only">{text}</span>
-      <span aria-hidden="true">{displayText}</span>
+      <span aria-hidden="true" className="terminalGlyphs" data-decryption-state={isDecrypted ? "settled" : "decoding"}>{displayText}</span>
     </span>
   );
 }

@@ -3,8 +3,36 @@
 /* Compact layouts for short landscape viewports, including mobile on-screen keyboards. */
 @custom-variant phoneLandscape (@media (orientation: landscape) and (max-height: 600px) and (max-width: 1024px));
 
+/** Uses an unmodified, locally bundled Korean pixel face for the terminal's main text. */
+@font-face {
+  font-family: "galmuriTerminal";
+  src: url("/fonts/galmuriMono11.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+/** Loads the supplied dot font locally, including in offline Capacitor bundles. */
+@font-face {
+  font-family: "gothicDotRound";
+  src:
+    url("/fonts/gothicDotRoundRegularV02.woff2") format("woff2"),
+    url("/fonts/gothicDotRoundRegularV02.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+/** Keeps Tailwind font utilities consistent with the terminal's shared typeface. */
+@theme inline {
+  --font-sans: var(--terminalFontFamily);
+  --font-mono: var(--terminalFontFamily);
+}
+
 :root {
   color-scheme: dark;
+  --terminalFontFamily: "galmuriTerminal", "IBM Plex Mono", "Noto Sans KR", "Malgun Gothic", monospace;
+  --terminalDotFontFamily: "gothicDotRound", var(--terminalFontFamily);
   --background: #000000;
   --panel: #050e18;
   --ink: #5cd0ff;
@@ -31,7 +59,9 @@ body {
   margin: 0;
   background: var(--background);
   color: var(--cyan-primary);
-  font-family: "IBM Plex Mono", "Noto Sans KR", "Malgun Gothic", monospace;
+  font-family: var(--terminalFontFamily);
+  /* Preserve the pixel grid and circular dots rather than synthesizing extra strokes. */
+  font-synthesis: none;
 }
 
 /* Fixed, click-through CRT overlays keep the effect consistent across every route. */
@@ -68,6 +98,75 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .directivePanel {
   color: var(--ink);
   background: transparent;
+}
+
+/** Reserves the supplied round-dot face for compact counters and the issue timestamp. */
+.terminalDotMeta {
+  font-family: var(--terminalDotFontFamily);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+/** Leaves a short, color-inheriting phosphor trail after a line finishes decrypting. */
+.terminalGlyphs[data-decryption-state="settled"] {
+  animation: terminalPhosphorSettle 650ms ease-out both;
+}
+
+@keyframes terminalPhosphorSettle {
+  from {
+    text-shadow: 0 0 1px currentColor, 0 0 9px color-mix(in srgb, currentColor 50%, transparent);
+  }
+  to {
+    text-shadow: 0 0 .5px currentColor, 0 0 5px color-mix(in srgb, currentColor 18%, transparent);
+  }
+}
+
+/* Failure visuals follow the attached alert's actual playback clock without flashing the whole screen. */
+.failureDirective {
+  color: var(--failure-ink, var(--ink));
+  background: radial-gradient(ellipse at center, var(--failure-overlay, transparent), transparent 72%);
+  text-shadow: 0 0 .5px currentColor, 0 0 7px color-mix(in srgb, currentColor 20%, transparent);
+  transition: color 80ms linear, background 80ms linear, text-shadow 80ms linear;
+}
+
+.failureDirective::after {
+  position: absolute;
+  inset: 0;
+  content: "";
+  pointer-events: none;
+  opacity: var(--failure-progress, 0);
+  background: repeating-linear-gradient(0deg, transparent 0 3px, #ff40550d 3px 5px);
+  mix-blend-mode: screen;
+}
+
+.failureDirectiveMeta { color: var(--failure-dim, var(--cyan-dim)); }
+
+/** Restores the audio-driven failure glow only while its red transition is active. */
+.failureDirective[data-failure-active="true"] {
+  text-shadow: 0 0 .5px currentColor, 0 0 12px var(--failure-glow, transparent);
+}
+
+/** Lets failure audio own the entire red transition without a competing blue afterglow. */
+.failureDirective[data-failure-active="true"] .terminalGlyphs {
+  animation: none;
+  text-shadow: inherit;
+}
+
+/* Decryption spans inherit normal cyan indirectly, so active failure playback pins the glyphs explicitly. */
+.failureDirective[data-failure-active="true"] .failureDirectiveBody,
+.failureDirective[data-failure-active="true"] .failureDirectiveBody span {
+  color: var(--failure-ink) !important;
+}
+
+.failureDirective[data-failure-active="true"] .failureDirectiveMeta,
+.failureDirective[data-failure-active="true"] .failureDirectiveMeta span {
+  color: var(--failure-dim) !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .terminalGlyphs[data-decryption-state="settled"] { animation: none; }
+  .failureDirective { transition: none; }
+  .failureDirective::after { background: none; }
 }
 
 .terminalField {
